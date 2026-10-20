@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-review-kit"
+version = "1.0.0"
+description = "Split a recorded video into size-limited, independently decodable MP4 review clips with traceable timestamps"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "video-review-kit contributors"}]
+keywords = ["ffmpeg", "video", "split", "review", "mp4"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video :: Conversion",
+]
+# Runtime uses the Python standard library only; FFmpeg/ffprobe are external
+# binaries that must be installed separately and are never bundled.
+dependencies = []
+
+[project.scripts]
+prep-video = "prep_video:main"
+
+[tool.setuptools]
+py-modules = ["prep_video"]

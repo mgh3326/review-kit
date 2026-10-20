@@ -71,6 +71,7 @@ class VideoTests(unittest.TestCase):
                 self.assertTrue(part["validated_full_decode"])
                 self.assertEqual(part["width"] % 2, 0)
                 self.assertEqual(part["height"] % 2, 0)
+            self.assertFalse(list(out.glob("*.incomplete.mp4")))
             return manifest
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((out / "DONE.txt").exists())
@@ -258,6 +259,63 @@ class VideoTests(unittest.TestCase):
         self.assertFalse((out / "DONE.txt").exists())
         self.assertFalse(list(out.glob("part_*.mp4")))
         self.assertEqual(json.loads((out / "manifest.json").read_text())["status"], "failed")
+
+    def test_size_cap_boundary_is_strict(self):
+        m = self.cli(self.short, "cap_edge_review")
+        part = self.work / "cap_edge_review" / m["segments"][0]["file"]
+        size = part.stat().st_size
+        ffprobe = shutil.which("ffprobe")
+        planned = m["segments"][0]["planned_duration_seconds"]
+        with self.assertRaisesRegex(prep.PrepError, "byte cap"):
+            prep.validate(part, self.ffmpeg, ffprobe, 30, planned, size)
+        checked, _, _, _ = prep.validate(part, self.ffmpeg, ffprobe, 30, planned, size + 1)
+        self.assertTrue(checked["streams"])
+        defaults = prep.parser().parse_args(["x"])
+        self.assertEqual(defaults.max_mb, 95.0)
+        self.assertEqual(m["settings"]["hard_cap_bytes_exclusive"], 95000000)
+
+    def test_max_seconds_boundary_is_enforced(self):
+        defaults = prep.parser().parse_args(["x"])
+        self.assertEqual(defaults.max_seconds, 120.0)
+        m = self.cli(self.audio, "duration_edge_review")
+        self.assertGreaterEqual(len(m["segments"]), 2)
+        for part in m["segments"]:
+            self.assertLessEqual(part["planned_duration_seconds"], 0.6)
+            self.assertLessEqual(part["video_duration_seconds"], 0.6 + 2 / 30 + 0.02)
+
+    def test_silent_input_records_audio_absent(self):
+        silent = self.work / "silent.mp4"
+        self.make(["-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30", "-t", "0.4",
+                   "-c:v", "libx264", "-pix_fmt", "yuv420p", str(silent)])
+        m = self.cli(silent, "silent_review")
+        self.assertFalse(m["source"]["audio_present"])
+        self.assertEqual(m["source"]["audio_origin"], "absent")
+        self.assertTrue(all(not s["audio_present"] and s["audio_origin"] == "absent"
+                            for s in m["segments"]))
+        checked = prep.probe(self.work / "silent_review" / m["segments"][0]["file"],
+                             shutil.which("ffprobe"), 30)
+        self.assertFalse(any(s.get("codec_type") == "audio" for s in checked["streams"]))
+
+    def test_interruption_writes_no_done(self):
+        out = self.work / "interrupted_review"
+        args = prep.parser().parse_args([str(self.audio), "-o", str(out)])
+        real_run = prep.run
+        def interrupt_encode(command, timeout):
+            if "-preset" in command:
+                raise KeyboardInterrupt
+            return real_run(command, timeout)
+        with mock.patch.object(prep, "run", side_effect=interrupt_encode):
+            with self.assertRaises(KeyboardInterrupt):
+                prep.process(args)
+        self.assertFalse((out / "DONE.txt").exists())
+        self.assertFalse((out / "ERROR.txt").exists())
+        self.assertEqual(json.loads((out / "manifest.json").read_text())["status"], "running")
+        argv = ["prep_video.py", str(self.short), "-o", str(self.work / "sigint_review")]
+        buffer = io.StringIO()
+        with mock.patch.object(prep, "process", side_effect=KeyboardInterrupt), \
+                mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(buffer):
+            self.assertEqual(prep.main(), 130)
+        self.assertIn("Interrupted", buffer.getvalue())
 
     def test_timeout_and_corrupt_decode(self):
         with mock.patch.object(prep.subprocess, "run", side_effect=subprocess.TimeoutExpired("ffmpeg", 1)):

@@ -10,7 +10,27 @@ Split a recorded video into short, size-limited MP4 files with traceable timesta
 - `ffmpeg` and `ffprobe` on PATH, with libx264 and AAC encoding support.
 - A local output filesystem supporting hard links for atomic, no-overwrite finalization.
 
-Tested on macOS with Python 3.9.6 and FFmpeg/ffprobe 9.0.2. Windows and Linux have not been tested. This project does not install dependencies, upload files, or require a cloud account. Install dependencies separately using your preferred platform tools if they are missing.
+OS support — exactly what has been verified:
+
+- **macOS: tests pass locally** on an Intel Mac (x86_64), macOS 26.6.2, Python 3.9.6 (`/usr/bin/python3`), FFmpeg/ffprobe 8.1 (`/usr/local/bin`).
+- **Linux and Windows: CI pending.** The suite runs on ubuntu-latest and windows-latest in `.github/workflows/ci.yml`, but is not verified until the first CI run finishes green.
+
+FFmpeg/ffprobe are external runtime dependencies: they are not bundled with and are not installed by this project. FFmpeg needs libx264 and AAC encoders. This project does not upload files or require a cloud account. Install dependencies separately using your preferred platform tools if they are missing.
+
+## Install
+
+The script has no third-party Python dependencies, so you can run it in place:
+
+```bash
+python3 prep_video.py --help
+```
+
+Or install the package to get the `prep-video` command on PATH:
+
+```bash
+python3 -m pip install .
+prep-video --help
+```
 
 ## Usage
 
@@ -71,8 +91,8 @@ On failure, completed clips are retained with `status: failed` and `ERROR.txt`; 
 PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py
 ```
 
-On Windows or a different environment, choose a writable cache path or omit the environment assignment. Tests create tiny synthetic inputs and preserve results under `test_artifacts/`. Successful paths use real FFmpeg/ffprobe. Certain oversize, timeout, missing-tool, and validation-failure cases use explicit mocks. Tests cover audio/no audio, delayed/short audio, delayed-video rejection, odd dimensions, portrait, one-frame clips, decimal/binary caps, Korean/space paths, collisions, bounded retries/floors, corrupted media, and final-metadata failure without DONE.
+On Windows or a different environment, choose a writable cache path or omit the environment assignment. Tests create tiny synthetic inputs and preserve results under `test_artifacts/`. Successful paths use real FFmpeg/ffprobe. Certain oversize, timeout, missing-tool, and validation-failure cases use explicit mocks. Tests cover audio/no audio, delayed/short audio, delayed-video rejection, odd dimensions, portrait, one-frame clips, decimal/binary caps, strict size-cap and duration boundaries, silent inputs recorded as audio absent, Korean/space paths, collisions, bounded retries/floors, interruption without DONE, corrupted media, and final-metadata failure without DONE.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). No third-party code is vendored: the only code in this repository is `prep_video.py` and its test file, plus documentation. FFmpeg/ffprobe are external runtime dependencies with their own licenses; they are not distributed here.
