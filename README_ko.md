@@ -125,4 +125,4 @@ python3 prep_video.py "/path/to/input.mp4" \
 
 ## 개발·플랫폼 검증
 
-이 Mac에서 로컬 테스트 통과를 확인한 환경: Intel Mac(x86_64), macOS 26.6.2, Python 3.9.6 (`/usr/bin/python3`), FFmpeg/ffprobe 8.1 (`/usr/local/bin`). Linux와 Windows는 `.github/workflows/ci.yml`에서 실행 예정이며 첫 CI가 통과하기 전까지 **CI 대기 중(미검증)**입니다. FFmpeg/ffprobe는 별도 외부 런타임 의존성이며 이 도구가 자동 설치하거나 프로젝트에 포함(번들)하지 않습니다. Python 외부 패키지는 필요하지 않습니다. 정상 출력은 실제 FFmpeg로 검사하고, 크기 초과·시간 초과·일부 검증 실패는 명시적으로 모의 주입합니다. 오디오 지연, 영상보다 먼저 끝나는 오디오, 한국어·공백 경로, 하한과 최종 메타데이터 실패도 검사합니다.
+이 Mac에서 로컬 테스트 통과를 확인한 환경: Intel Mac(x86_64), macOS 26.6.2, Python 3.9.6 (`/usr/bin/python3`), FFmpeg/ffprobe 8.1 (`/usr/local/bin`). CI는 ubuntu-latest·macos-latest·windows-latest × Python 3.9/3.12/3.14 전체 9개 잡이 run [39414034940](https://github.com/mgh3326/video-review-kit/actions/runs/39414034940)에서 통과했습니다(`.github/workflows/ci.yml`). FFmpeg/ffprobe는 별도 외부 런타임 의존성이며 이 도구가 자동 설치하거나 프로젝트에 포함(번들)하지 않습니다. Python 외부 패키지는 필요하지 않습니다. 정상 출력은 실제 FFmpeg로 검사하고, 크기 초과·시간 초과·일부 검증 실패는 명시적으로 모의 주입합니다. 오디오 지연, 영상보다 먼저 끝나는 오디오, 한국어·공백 경로, 하한과 최종 메타데이터 실패도 검사합니다.

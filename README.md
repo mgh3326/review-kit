@@ -13,7 +13,7 @@ Split a recorded video into short, size-limited MP4 files with traceable timesta
 OS support — exactly what has been verified:
 
 - **macOS: tests pass locally** on an Intel Mac (x86_64), macOS 26.6.2, Python 3.9.6 (`/usr/bin/python3`), FFmpeg/ffprobe 8.1 (`/usr/local/bin`).
-- **Linux and Windows: CI pending.** The suite runs on ubuntu-latest and windows-latest in `.github/workflows/ci.yml`, but is not verified until the first CI run finishes green.
+- **CI: all 9 matrix jobs green** in run [39414034940](https://github.com/mgh3326/video-review-kit/actions/runs/39414034940) on ubuntu-latest, macos-latest, and windows-latest × Python 3.9, 3.12, and 3.14 (`.github/workflows/ci.yml`).
 
 FFmpeg/ffprobe are external runtime dependencies: they are not bundled with and are not installed by this project. FFmpeg needs libx264 and AAC encoders. This project does not upload files or require a cloud account. Install dependencies separately using your preferred platform tools if they are missing.
 
