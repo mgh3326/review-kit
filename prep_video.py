@@ -65,15 +65,20 @@ def parser():
 
 def run(command, timeout):
     try:
+        # ffprobe/ffmpeg emit UTF-8 (e.g. JSON filename fields); decode explicitly so a
+        # non-UTF-8 locale codepage (cp1252 on Windows) cannot corrupt or crash decoding.
         result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, timeout=timeout)
+                                stderr=subprocess.PIPE, encoding="utf-8", errors="replace",
+                                timeout=timeout)
     except subprocess.TimeoutExpired:
         raise PrepError("Command timed out after %ss: %s" % (timeout, command[0]))
     except OSError as exc:
         raise PrepError("Cannot run %s: %s" % (command[0], exc))
     if result.returncode:
         raise PrepError("Command failed (%s): %s\n%s" %
-                        (result.returncode, command[0], result.stderr[-6000:]))
+                        (result.returncode, command[0], (result.stderr or "")[-6000:]))
+    if result.stdout is None:
+        raise PrepError("No output captured from: %s" % command[0])
     return result.stdout
 
 
@@ -394,6 +399,9 @@ def process(args):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     args = parser().parse_args()
     try:
         process(args)

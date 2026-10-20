@@ -45,7 +45,7 @@ class VideoTests(unittest.TestCase):
     @classmethod
     def make(cls, options):
         result = subprocess.run([cls.ffmpeg, "-hide_banner", "-v", "error", "-nostdin", "-n"] + options,
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, encoding="utf-8", errors="replace", timeout=30)
         if result.returncode:
             raise AssertionError(result.stderr)
 
@@ -53,11 +53,12 @@ class VideoTests(unittest.TestCase):
         out = self.work / name
         command = [sys.executable, str(ROOT / "prep_video.py"), str(source),
                    "--vkbps", "400", "--max-seconds", "0.6", "-o", str(out)] + list(extra)
-        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(command, capture_output=True, encoding="utf-8",
+                                errors="replace", timeout=60)
         if ok:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((out / "DONE.txt").is_file())
-            manifest = json.loads((out / "manifest.json").read_text())
+            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["status"], "complete")
             parts = manifest["segments"]
             self.assertEqual(parts[0]["original_start_seconds"], 0)
@@ -201,7 +202,7 @@ class VideoTests(unittest.TestCase):
             else:
                 with self.assertRaisesRegex(prep.PrepError, "exceeds cap"):
                     prep.process(args)
-        m = json.loads((out / "manifest.json").read_text())
+        m = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(len(calls), 2 if recover else 3)
         self.assertEqual(m["status"], "complete" if recover else "failed")
         self.assertEqual((out / "DONE.txt").exists(), recover)
@@ -248,7 +249,7 @@ class VideoTests(unittest.TestCase):
             with self.assertRaisesRegex(prep.PrepError, "final metadata failure"):
                 prep.process(args)
         self.assertFalse((out / "DONE.txt").exists())
-        self.assertEqual(json.loads((out / "manifest.json").read_text())["status"], "failed")
+        self.assertEqual(json.loads((out / "manifest.json").read_text(encoding="utf-8"))["status"], "failed")
 
     def test_validation_failure_no_done(self):
         args = prep.parser().parse_args([str(self.short), "-o", str(self.work / "validation_failure")])
@@ -258,7 +259,7 @@ class VideoTests(unittest.TestCase):
         out = self.work / "validation_failure"
         self.assertFalse((out / "DONE.txt").exists())
         self.assertFalse(list(out.glob("part_*.mp4")))
-        self.assertEqual(json.loads((out / "manifest.json").read_text())["status"], "failed")
+        self.assertEqual(json.loads((out / "manifest.json").read_text(encoding="utf-8"))["status"], "failed")
 
     def test_size_cap_boundary_is_strict(self):
         m = self.cli(self.short, "cap_edge_review")
@@ -309,13 +310,27 @@ class VideoTests(unittest.TestCase):
                 prep.process(args)
         self.assertFalse((out / "DONE.txt").exists())
         self.assertFalse((out / "ERROR.txt").exists())
-        self.assertEqual(json.loads((out / "manifest.json").read_text())["status"], "running")
+        self.assertEqual(json.loads((out / "manifest.json").read_text(encoding="utf-8"))["status"], "running")
         argv = ["prep_video.py", str(self.short), "-o", str(self.work / "sigint_review")]
         buffer = io.StringIO()
         with mock.patch.object(prep, "process", side_effect=KeyboardInterrupt), \
                 mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(buffer):
             self.assertEqual(prep.main(), 130)
         self.assertIn("Interrupted", buffer.getvalue())
+
+    def test_utf8_subprocess_decode_path(self):
+        # prep.run must decode ffprobe/ffmpeg UTF-8 output on any locale codepage.
+        payload = {"format": {"filename": "한글 공백 원본.mp4"}, "streams": []}
+        script = "import sys; sys.stdout.buffer.write(" + repr(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")) + ")"
+        self.assertEqual(json.loads(prep.run([sys.executable, "-c", script], 30)), payload)
+        broken = prep.run([sys.executable, "-c",
+                           "import sys; sys.stdout.buffer.write(b'\\x90\\xff')"], 30)
+        self.assertIn("\ufffd", broken)
+        result = subprocess.CompletedProcess([], 0, stdout=None, stderr="")
+        with mock.patch.object(prep.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(prep.PrepError, "No output"):
+                prep.run(["x"], 1)
 
     def test_timeout_and_corrupt_decode(self):
         with mock.patch.object(prep.subprocess, "run", side_effect=subprocess.TimeoutExpired("ffmpeg", 1)):
