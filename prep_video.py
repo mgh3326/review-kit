@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import platform
 from pathlib import Path
 import shutil
 import struct
@@ -18,7 +19,15 @@ from fractions import Fraction
 
 
 class PrepError(Exception):
-    pass
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details
+
+
+HDR_TRANSFERS = {"smpte2084": "PQ (SMPTE ST 2084)", "arib-std-b67": "HLG (ARIB STD-B67)"}
+HDR_SIDE_DATA = ("mastering display", "content light level", "dolby vision", "dovi")
+UNSPECIFIED = (None, "", "unknown", "unspecified", "reserved")
+REQUIRED_FILTERS = ("scale", "setsar", "fps", "format", "setparams")
 
 
 def finite_positive(value):
@@ -98,6 +107,82 @@ def positive_number(value):
         return None
 
 
+def specified(value):
+    return None if value in UNSPECIFIED else value
+
+
+def pixel_formats(ffprobe, timeout):
+    try:
+        data = json.loads(run([ffprobe, "-v", "error", "-show_pixel_formats", "-of", "json"], timeout))
+        return {p["name"]: p.get("flags", {}) for p in data["pixel_formats"]}
+    except (ValueError, KeyError, TypeError) as exc:
+        raise PrepError("Cannot read ffprobe pixel formats: %s" % exc)
+
+
+def first_frame(path, ffprobe, timeout):
+    """FFmpeg's decoded interpretation of the first frame (may differ from stream tags)."""
+    try:
+        frames = json.loads(run([ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+                                 "-show_frames", "-show_entries",
+                                 "frame=pix_fmt,color_range,color_space,color_transfer,color_primaries",
+                                 "-of", "json", str(path)], timeout)).get("frames", [])
+    except ValueError as exc:
+        raise PrepError("Invalid ffprobe frame JSON: %s" % exc)
+    return frames[0] if frames else {}
+
+
+def color_plan(stream, frame, formats):
+    """Decide range handling from stream tags and FFmpeg's decoded first frame; refuse what is unsafe.
+
+    Output is always limited-range ("tv") yuv420p. Primaries/transfer/matrix are never retagged.
+    """
+    keys = ("color_range", "color_space", "color_transfer", "color_primaries")
+    pix_fmt = stream.get("pix_fmt")
+    plan = {"input_pix_fmt": pix_fmt, "input_sample_aspect_ratio": stream.get("sample_aspect_ratio"),
+            "input_stream": {k: stream.get(k) for k in keys},
+            "input_first_frame": {k: frame.get(k) for k in ("pix_fmt",) + keys},
+            "output_pix_fmt": "yuv420p", "output_color_range": "tv"}
+    rotations = [d.get("rotation") for d in stream.get("side_data_list", []) if "rotation" in d]
+    plan["input_rotation"] = rotations[0] if rotations else None
+    for key in ("color_transfer", "color_primaries", "color_space"):
+        a, b = specified(stream.get(key)), specified(frame.get(key))
+        if a and b and a != b:
+            raise PrepError("Input %s conflicts: stream=%s, decoded frame=%s; refusing to guess" % (key, a, b))
+    transfer = specified(stream.get("color_transfer")) or specified(frame.get("color_transfer"))
+    hdr_side = [d.get("side_data_type") for d in stream.get("side_data_list", [])
+                if any(m in str(d.get("side_data_type", "")).lower() for m in HDR_SIDE_DATA)]
+    if transfer in HDR_TRANSFERS or hdr_side:
+        raise PrepError("HDR input is unsupported (transfer=%s, side data=%s). Tone mapping to SDR is not "
+                        "implemented; converting would silently change colors. Export an SDR "
+                        "(BT.709) version first." % (HDR_TRANSFERS.get(transfer, transfer), hdr_side or "none"))
+    if pix_fmt not in formats:
+        raise PrepError("Input pixel format %r is unknown to this ffprobe" % pix_fmt)
+    flags = formats[pix_fmt]
+    if flags.get("rgb") or flags.get("palette"):
+        # RGB has no YUV range; swscale converts it to YUV with the explicit output range.
+        plan.update(input_range="not_applicable_rgb", range_policy="rgb_to_limited_yuv", in_range=None)
+        return plan
+    stream_range, frame_range = specified(stream.get("color_range")), specified(frame.get("color_range"))
+    if stream_range and frame_range and stream_range != frame_range:
+        raise PrepError("Input color_range conflicts: stream=%s, decoded frame=%s; refusing to guess" %
+                        (stream_range, frame_range))
+    tagged = stream_range or frame_range
+    if tagged not in (None, "tv", "pc"):
+        raise PrepError("Input color_range %r is not understood; refusing to guess" % tagged)
+    j_format = str(pix_fmt).startswith("yuvj")
+    if j_format and tagged == "tv":
+        raise PrepError("Input pix_fmt %s implies full range but color_range=tv; refusing to guess" % pix_fmt)
+    if tagged == "pc" or j_format:
+        plan.update(input_range="pc", range_policy="full_to_limited", in_range="full")
+    elif tagged == "tv":
+        plan.update(input_range="tv", range_policy="limited_passthrough", in_range="limited")
+    else:
+        # H.264/HEVC default (video_full_range_flag=0) and swscale's treatment of unspecified YUV.
+        plan.update(input_range="unspecified", range_policy="unspecified_yuv_treated_as_limited",
+                    in_range="limited")
+    return plan
+
+
 def finite_number(value):
     try:
         number = float(value)
@@ -156,7 +241,7 @@ def faststart(path):
     return b"moov" in boxes and b"mdat" in boxes and boxes.index(b"moov") < boxes.index(b"mdat")
 
 
-def validate(path, ffmpeg, ffprobe, timeout, planned_duration, cap_bytes):
+def validate(path, ffmpeg, ffprobe, timeout, planned_duration, cap_bytes, plan=None):
     if not 0 < path.stat().st_size < cap_bytes:
         raise PrepError("Output is empty or does not satisfy strict byte cap")
     metadata = probe(path, ffprobe, timeout)
@@ -165,9 +250,32 @@ def validate(path, ffmpeg, ffprobe, timeout, planned_duration, cap_bytes):
     if len(videos) != 1:
         raise PrepError("Expected exactly one output video stream")
     v = videos[0]
-    if (v.get("codec_name") != "h264" or v.get("pix_fmt") != "yuv420p"
-            or v.get("width", 1) % 2 or v.get("height", 1) % 2):
-        raise PrepError("Output is not portable H.264/yuv420p with even dimensions")
+    observed = {k: v.get(k) for k in ("codec_name", "pix_fmt", "width", "height", "color_range",
+                                      "color_space", "color_transfer", "color_primaries")}
+    failed = []
+    if v.get("codec_name") != "h264":
+        failed.append("codec_name != h264")
+    if v.get("pix_fmt") != "yuv420p":
+        failed.append("pix_fmt != yuv420p")
+    # x264 omits the VUI signal type for untagged limited output; H.264 then defaults to limited.
+    untagged = not any(specified(v.get(k)) for k in ("color_range", "color_space",
+                                                      "color_transfer", "color_primaries"))
+    if v.get("color_range") != "tv" and not untagged:
+        failed.append("color_range != tv")
+    if not isinstance(v.get("width"), int) or v["width"] % 2 or v["width"] <= 0:
+        failed.append("width not positive even")
+    if not isinstance(v.get("height"), int) or v["height"] % 2 or v["height"] <= 0:
+        failed.append("height not positive even")
+    if plan and plan.get("input_range") != "not_applicable_rgb":
+        for key in ("color_space", "color_transfer", "color_primaries"):
+            source = (specified(plan["input_stream"].get(key))
+                      or specified(plan["input_first_frame"].get(key)))
+            if source and specified(v.get(key)) != source:
+                failed.append("%s changed from input %s" % (key, source))
+    if failed:
+        raise PrepError("Output is not portable H.264/yuv420p (limited range, even dimensions): %s; "
+                        "failed: %s" % (" ".join("%s=%s" % kv for kv in observed.items()), ", ".join(failed)),
+                        {"output_video": observed, "failed_conditions": failed})
     try:
         if Fraction(v.get("avg_frame_rate", "0")) != 30:
             raise ValueError("not 30fps")
@@ -191,16 +299,19 @@ def validate(path, ffmpeg, ffprobe, timeout, planned_duration, cap_bytes):
     return metadata, video_duration, actual_duration, bool(audios)
 
 
-def encode_command(ffmpeg, source, temporary, start, duration, height, bitrate, audio):
+def encode_command(ffmpeg, source, temporary, start, duration, height, bitrate, audio, in_range=None):
     # Respect input sample aspect ratio; floor both dimensions to an even number.
+    # Pixels are range-converted by the scaler; setparams then labels frames "tv" (a passthrough
+    # scale keeps an unspecified tag, and FFmpeg 7+ lets frame tags override -color_range).
+    ranges = (":in_range=%s" % in_range if in_range else "") + ":out_range=limited"
     scale = ("scale=w='max(2,trunc(iw*sar*min(1,%d/ih)/2)*2)':"
-             "h='max(2,trunc(ih*min(1,%d/ih)/2)*2)',setsar=1,"
-             "fps=fps=30:round=up,format=yuv420p") % (height, height)
+             "h='max(2,trunc(ih*min(1,%d/ih)/2)*2)'%s,setsar=1,"
+             "fps=fps=30:round=up,format=yuv420p,setparams=range=tv") % (height, height, ranges)
     command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-n",
                "-ss", "%.9f" % start, "-i", str(source), "-t", "%.9f" % duration,
                "-map", "0:v:0", "-vf", scale, "-c:v", "libx264", "-preset", "veryfast",
                "-b:v", "%dk" % bitrate, "-maxrate", "%dk" % bitrate,
-               "-bufsize", "%dk" % (bitrate * 2), "-pix_fmt", "yuv420p"]
+               "-bufsize", "%dk" % (bitrate * 2), "-pix_fmt", "yuv420p", "-color_range", "tv"]
     if audio:
         command += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "96k", "-ar", "48000"]
     else:
@@ -251,6 +362,16 @@ def process(args):
     encoders = run([ffmpeg, "-hide_banner", "-encoders"], args.timeout)
     if "libx264" not in encoders or " aac " not in encoders:
         raise PrepError("This FFmpeg needs libx264 and AAC encoders")
+    # Filter rows look like " .. scale  V->V  description"; the third column holds "->".
+    filters = {parts[1] for parts in map(str.split, run([ffmpeg, "-hide_banner", "-filters"],
+                                                        args.timeout).splitlines())
+               if len(parts) > 2 and "->" in parts[2]}
+    missing = [f for f in REQUIRED_FILTERS if f not in filters]
+    scale_help = run([ffmpeg, "-hide_banner", "-h", "filter=scale"], args.timeout)
+    scale_words = set(scale_help.split())
+    if missing or not {"in_range", "out_range", "full", "limited"} <= scale_words:
+        raise PrepError("This FFmpeg lacks required filters/options (missing filters: %s; scale "
+                        "in_range/out_range with full/limited values needed)" % (", ".join(missing) or "none"))
     source_identity = identity(source)
     metadata = probe(source, ffprobe, args.timeout)
     videos = [s for s in metadata.get("streams", []) if s.get("codec_type") == "video"
@@ -262,6 +383,10 @@ def process(args):
                                                          if s.get("codec_type") == "video"):
         raise PrepError("Leading cover-art video is unsupported; select a source without cover art")
     v = videos[0]
+    plan = color_plan(v, first_frame(source, ffprobe, args.timeout), pixel_formats(ffprobe, args.timeout))
+    if plan["range_policy"] == "unspecified_yuv_treated_as_limited":
+        print("NOTE: input color_range is unspecified; treated as limited (codec default and FFmpeg's "
+              "interpretation), no range conversion. Recorded in manifest.json.", file=sys.stderr, flush=True)
     video_start = finite_number(v.get("start_time"))
     format_start = finite_number(metadata.get("format", {}).get("start_time"))
     if (video_start is not None and format_start is not None
@@ -311,6 +436,11 @@ def process(args):
                              "time_mapping": "relative to source playback origin; original = planned_start + local",
                              "video_duration_tolerance_seconds": 2 / 30 + 0.02,
                              "container_overrun_tolerance_seconds": 0.15},
+                "color": plan,
+                "diagnostics": {"argv": sys.argv[:], "python": sys.executable, "cwd": os.getcwd(),
+                                "platform": {"system": platform.system(), "release": platform.release(),
+                                             "machine": platform.machine()},
+                                "tools": {"ffmpeg": ffmpeg, "ffprobe": ffprobe}},
                 "segments": [], "thumbnails": [], "encoding_attempts": []}
     try:
         save_manifest(out, manifest)
@@ -324,7 +454,7 @@ def process(args):
             bitrate = args.vkbps
             for attempt in range(1, args.attempts + 1):
                 command = encode_command(ffmpeg, source, temporary, start, planned,
-                                         args.height, bitrate, audio)
+                                         args.height, bitrate, audio, plan["in_range"])
                 record = {"part": filename, "attempt": attempt, "video_kbps": bitrate, "command": command}
                 manifest["encoding_attempts"].append(record)
                 save_manifest(out, manifest)
@@ -343,7 +473,7 @@ def process(args):
                                     (filename, attempt, args.attempts, size, cap_bytes, args.min_vkbps))
                 bitrate = next_bitrate
             checked, video_duration, actual_duration, has_audio = validate(
-                temporary, ffmpeg, ffprobe, args.timeout, planned, cap_bytes)
+                temporary, ffmpeg, ffprobe, args.timeout, planned, cap_bytes, plan)
             record["result"] = "validated"
             # Hard-link creation is atomic and refuses an existing destination (no overwrite race).
             os.link(str(temporary), str(final))
@@ -354,7 +484,9 @@ def process(args):
                        "bytes": final.stat().st_size, "sha256": sha256(final), "audio_present": has_audio,
                        "audio_origin": args.audio_origin if has_audio else "absent", "video_kbps": bitrate,
                        "attempts": attempt, "width": checked["streams"][0]["width"],
-                       "height": checked["streams"][0]["height"], "validated_full_decode": True}
+                       "height": checked["streams"][0]["height"],
+                       "color_range": checked["streams"][0].get("color_range"),
+                       "pix_fmt": checked["streams"][0].get("pix_fmt"), "validated_full_decode": True}
             manifest["segments"].append(segment)
             save_manifest(out, manifest)
             write_mapping(out, manifest)
@@ -388,6 +520,10 @@ def process(args):
     except Exception as exc:
         manifest["status"] = "failed"
         manifest["error"] = str(exc)
+        if manifest["encoding_attempts"]:
+            manifest["diagnostics"]["last_encode_command"] = manifest["encoding_attempts"][-1]["command"]
+        if getattr(exc, "details", None):
+            manifest["diagnostics"]["failure"] = exc.details
         for temporary in out.glob(".*.incomplete.mp4"):
             temporary.unlink(missing_ok=True)
         save_manifest(out, manifest)

@@ -332,6 +332,188 @@ class VideoTests(unittest.TestCase):
             with self.assertRaisesRegex(prep.PrepError, "No output"):
                 prep.run(["x"], 1)
 
+    def range_source(self, name, low, high, full, tagged=True, size="64x64", options=(),
+                     fmt=None, codec=("libx264", "-qp", "0")):
+        """Lossless left/right luma split; returns the source path."""
+        source = self.work / name
+        fmt = fmt or ("yuvj420p" if full else "yuv420p")
+        params = ""
+        if tagged:
+            params = (",setparams=range=%s:color_primaries=bt709:color_trc=bt709:colorspace=bt709" %
+                      ("pc" if full else "tv"))
+        self.make(["-f", "lavfi", "-i", "nullsrc=s=%s:r=30,geq=lum='if(lt(X,W/2),%d,%d)':cb=128:cr=128,"
+                   "format=%s%s" % (size, low, high, fmt, params)] + list(options) +
+                  ["-t", "0.5", "-c:v"] + list(codec) + ["-pix_fmt", fmt, str(source)])
+        return source
+
+    def luma(self, path, x, y, width):
+        raw = subprocess.run([self.ffmpeg, "-v", "error", "-i", str(path), "-frames:v", "1",
+                              "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"], capture_output=True, timeout=30)
+        self.assertEqual(raw.returncode, 0, raw.stderr)
+        return raw.stdout[y * width + x]
+
+    def assert_luma(self, part, expected_low, expected_high):
+        probe = prep.probe(part, shutil.which("ffprobe"), 30)["streams"][0]
+        self.assertEqual(probe["pix_fmt"], "yuv420p")
+        width = probe["width"]
+        self.assertAlmostEqual(self.luma(part, 8, 32, width), expected_low, delta=3)
+        self.assertAlmostEqual(self.luma(part, width - 8, 32, width), expected_high, delta=3)
+        return probe
+
+    def test_full_range_pixels_converted_to_limited(self):
+        source = self.range_source("full_bw.mp4", 0, 255, True)
+        before = prep.sha256(source)
+        m = self.cli(source, "full_bw_review")
+        self.assertEqual(m["color"]["range_policy"], "full_to_limited")
+        self.assertEqual(m["color"]["input_stream"]["color_range"], "pc")
+        probe = self.assert_luma(self.work / "full_bw_review" / "part_000.mp4", 16, 235)
+        self.assertEqual(probe["color_range"], "tv")
+        # SDR tags are carried through, never invented or overwritten.
+        self.assertEqual((probe["color_space"], probe["color_transfer"], probe["color_primaries"]),
+                         ("bt709", "bt709", "bt709"))
+        self.assertEqual(before, prep.sha256(source))
+
+    def test_limited_range_not_converted_twice(self):
+        source = self.range_source("limited_bw.mp4", 16, 235, False)
+        m = self.cli(source, "limited_bw_review")
+        self.assertEqual(m["color"]["range_policy"], "limited_passthrough")
+        # A second full->limited squeeze would give roughly 30/218.
+        probe = self.assert_luma(self.work / "limited_bw_review" / "part_000.mp4", 16, 235)
+        self.assertEqual(probe["color_range"], "tv")
+
+    def test_unspecified_range_policy_recorded(self):
+        source = self.range_source("untagged_bw.mp4", 16, 235, False, tagged=False)
+        out = self.work / "untagged_bw_review"
+        result = subprocess.run([sys.executable, str(ROOT / "prep_video.py"), str(source), "-o", str(out)],
+                                capture_output=True, encoding="utf-8", errors="replace", timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unspecified", result.stderr)
+        m = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(m["color"]["range_policy"], "unspecified_yuv_treated_as_limited")
+        self.assertEqual(m["color"]["in_range"], "limited")
+        self.assert_luma(out / "part_000.mp4", 16, 235)
+
+    def test_legacy_full_range_failure_reproduced_and_fixed(self):
+        source = self.range_source("legacy_full.mp4", 0, 255, True)
+        ffprobe = shutil.which("ffprobe")
+        legacy = self.work / "legacy_out.mp4"
+        command = prep.encode_command(self.ffmpeg, source, legacy, 0, 0.5, 1080, 400, False, "full")
+        vf = command.index("-vf") + 1
+        # The pre-fix filter graph and output options, verbatim.
+        command[vf] = ("scale=w='max(2,trunc(iw*sar*min(1,1080/ih)/2)*2)':"
+                       "h='max(2,trunc(ih*min(1,1080/ih)/2)*2)',setsar=1,fps=fps=30:round=up,format=yuv420p")
+        del command[command.index("-color_range"):command.index("-color_range") + 2]
+        prep.run(command, 30)
+        legacy_video = prep.probe(legacy, ffprobe, 30)["streams"][0]
+        if legacy_video.get("pix_fmt") == "yuv420p" and legacy_video.get("color_range") != "pc":
+            self.skipTest("this FFmpeg converts range implicitly; legacy failure not reproducible here")
+        with self.assertRaises(prep.PrepError) as caught:
+            prep.validate(legacy, self.ffmpeg, ffprobe, 30, 0.5, 95000000)
+        message = str(caught.exception)
+        for fragment in ("pix_fmt=%s" % legacy_video["pix_fmt"], "color_range=pc", "codec_name=h264",
+                         "width=64", "height=64", "failed:"):
+            self.assertIn(fragment, message)
+        self.assertEqual(caught.exception.details["output_video"]["color_range"], "pc")
+        fixed = self.work / "fixed_out.mp4"
+        prep.run(prep.encode_command(self.ffmpeg, source, fixed, 0, 0.5, 1080, 400, False, "full"), 30)
+        checked, _, _, _ = prep.validate(fixed, self.ffmpeg, ffprobe, 30, 0.5, 95000000)
+        self.assertEqual((checked["streams"][0]["pix_fmt"], checked["streams"][0]["color_range"]),
+                         ("yuv420p", "tv"))
+        # Failure manifests keep the failing command and the observed output values.
+        out = self.work / "legacy_manifest_review"
+        args = prep.parser().parse_args([str(source), "-o", str(out)])
+        real_command = prep.encode_command
+        def legacy_encode(*a, **k):
+            c = real_command(*a, **k)
+            c[c.index("-vf") + 1] = command[vf]
+            del c[c.index("-color_range"):c.index("-color_range") + 2]
+            return c
+        with mock.patch.object(prep, "encode_command", side_effect=legacy_encode), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(prep.PrepError, "color_range=pc"):
+                prep.process(args)
+        m = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(m["status"], "failed")
+        self.assertFalse((out / "DONE.txt").exists())
+        self.assertFalse(list(out.glob("*.mp4")) + list(out.glob(".*.mp4")))
+        self.assertEqual(m["diagnostics"]["failure"]["output_video"]["color_range"], "pc")
+        self.assertEqual(m["diagnostics"]["last_encode_command"][0], self.ffmpeg)
+        self.assertEqual(m["color"]["range_policy"], "full_to_limited")
+
+    def test_rotation_90_full_range_with_audio(self):
+        coded = self.range_source("rot_coded.mp4", 0, 255, True, size="120x256",
+                                  options=["-f", "lavfi", "-i", "sine=sample_rate=48000",
+                                           "-c:a", "aac", "-shortest"])
+        source = self.work / "rot90.mp4"
+        self.make(["-display_rotation", "90", "-i", str(coded), "-c", "copy", str(source)])
+        stream = prep.probe(source, shutil.which("ffprobe"), 30)["streams"][0]
+        if not any(d.get("rotation") for d in stream.get("side_data_list", [])):
+            self.skipTest("this FFmpeg cannot write display rotation")
+        m = self.cli(source, "rot90_review", ["--height", "100", "--audio-origin", "actual"])
+        self.assertIn(m["color"]["input_rotation"], (90, -90))
+        # Displayed 256x120 scaled to height 100: floor-even(256*100/120) = 212.
+        self.assertEqual((m["segments"][0]["width"], m["segments"][0]["height"]), (212, 100))
+        self.assertTrue(m["segments"][0]["audio_present"])
+        self.assertEqual(m["segments"][0]["color_range"], "tv")
+
+    def test_odd_size_full_range_no_upscale(self):
+        source = self.range_source("odd_full.mkv", 0, 255, True, size="321x181",
+                                   fmt="yuvj444p")
+        m = self.cli(source, "odd_full_review")
+        self.assertEqual(m["color"]["range_policy"], "full_to_limited")
+        self.assertEqual((m["segments"][0]["width"], m["segments"][0]["height"]), (320, 180))
+        self.assertEqual(m["segments"][0]["color_range"], "tv")
+        self.assertFalse(m["source"]["audio_present"])
+
+    def test_hdr_rejected_before_output(self):
+        for transfer in ("smpte2084", "arib-std-b67"):
+            with self.subTest(transfer=transfer):
+                source = self.work / ("hdr_%s.mp4" % transfer)
+                self.make(["-f", "lavfi", "-i", "testsrc2=size=64x64:rate=30,format=yuv420p10le,setparams="
+                           "range=tv:color_primaries=bt2020:color_trc=%s:colorspace=bt2020nc" % transfer,
+                           "-t", "0.3", "-c:v", "libx264", "-pix_fmt", "yuv420p10le", str(source)])
+                if prep.probe(source, shutil.which("ffprobe"), 30)["streams"][0].get("color_transfer") != transfer:
+                    self.skipTest("this FFmpeg did not tag the HDR fixture")
+                result = self.cli(source, "hdr_review_%s" % transfer, ok=False)
+                self.assertIn("HDR input is unsupported", result.stderr)
+                self.assertFalse((self.work / ("hdr_review_%s" % transfer)).exists())
+
+    def test_color_plan_policies(self):
+        formats = prep.pixel_formats(shutil.which("ffprobe"), 30)
+        plan = lambda stream, frame=None: prep.color_plan(stream, frame or {}, formats)
+        self.assertEqual(plan({"pix_fmt": "yuvj420p"})["range_policy"], "full_to_limited")
+        self.assertEqual(plan({"pix_fmt": "yuv420p", "color_range": "pc"})["in_range"], "full")
+        self.assertEqual(plan({"pix_fmt": "yuv420p10le", "color_range": "tv"})["range_policy"],
+                         "limited_passthrough")
+        self.assertEqual(plan({"pix_fmt": "yuv420p"}, {"color_range": "pc"})["input_range"], "pc")
+        self.assertEqual(plan({"pix_fmt": "bgr0", "color_range": "pc"})["range_policy"], "rgb_to_limited_yuv")
+        for stream, frame, pattern in (
+                ({"pix_fmt": "yuvj420p", "color_range": "tv"}, {}, "implies full range"),
+                ({"pix_fmt": "yuv420p", "color_range": "pc"}, {"color_range": "tv"}, "color_range conflicts"),
+                ({"pix_fmt": "yuv420p", "color_transfer": "bt709"}, {"color_transfer": "smpte2084"},
+                 "color_transfer conflicts"),
+                ({"pix_fmt": "yuv420p", "color_range": "weird"}, {}, "not understood"),
+                ({"pix_fmt": "no_such_fmt"}, {}, "unknown to this ffprobe"),
+                ({"pix_fmt": "yuv420p", "side_data_list": [{"side_data_type": "Mastering display metadata"}]},
+                 {}, "HDR input is unsupported"),
+                ({"pix_fmt": "yuv420p"}, {"color_transfer": "arib-std-b67"}, "HDR input is unsupported")):
+            with self.subTest(stream=stream, frame=frame):
+                with self.assertRaisesRegex(prep.PrepError, pattern):
+                    plan(stream, frame)
+
+    def test_missing_filter_capability_fails_clearly(self):
+        args = prep.parser().parse_args([str(self.short), "-o", str(self.work / "no_filter_review")])
+        real_run = prep.run
+        def no_setparams(command, timeout):
+            text = real_run(command, timeout)
+            if "-filters" in command:
+                return "\n".join(l for l in text.splitlines() if " setparams " not in l)
+            return text
+        with mock.patch.object(prep, "run", side_effect=no_setparams):
+            with self.assertRaisesRegex(prep.PrepError, "missing filters: setparams"):
+                prep.process(args)
+        self.assertFalse((self.work / "no_filter_review").exists())
+
     def test_timeout_and_corrupt_decode(self):
         with mock.patch.object(prep.subprocess, "run", side_effect=subprocess.TimeoutExpired("ffmpeg", 1)):
             with self.assertRaisesRegex(prep.PrepError, "timed out"):

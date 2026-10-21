@@ -7,12 +7,13 @@ Split a recorded video into short, size-limited MP4 files with traceable timesta
 ## Requirements
 
 - Python 3.9 or newer, standard library only.
-- `ffmpeg` and `ffprobe` on PATH, with libx264 and AAC encoding support.
+- `ffmpeg` and `ffprobe` on PATH (found via PATH, never a hard-coded install directory), with libx264 and AAC encoders and the `scale` (with `in_range`/`out_range`), `setsar`, `fps`, `format`, and `setparams` filters. Missing capabilities fail before any output is written. Encoding is always software libx264; the same command works on Apple Silicon and Intel Macs, with no CPU-specific options.
 - A local output filesystem supporting hard links for atomic, no-overwrite finalization.
 
 OS support — exactly what has been verified:
 
-- **macOS: tests pass locally** on an Intel Mac (x86_64), macOS 26.6.2, Python 3.9.6 (`/usr/bin/python3`), FFmpeg/ffprobe 8.1 (`/usr/local/bin`).
+- **macOS Apple Silicon (arm64): tests pass locally** with the color-range fix — macOS 27.0.1, Python 3.14.7, FFmpeg/ffprobe 9.0.2 (Homebrew). A real 245.7 s full-range (`yuvj420p`/`pc`, BT.709, rotation 90) HEVC screen recording was also processed end to end into 3 validated clips.
+- **macOS Intel (x86_64): not yet re-verified with the color-range fix.** Earlier code (before the fix) passed tests on macOS 26.6.2, Python 3.9.6, FFmpeg/ffprobe 8.1. CI's `macos-latest` runner is Apple Silicon, so CI does not cover Intel.
 - **CI: all 9 matrix jobs green** in run [39414034940](https://github.com/mgh3326/video-review-kit/actions/runs/39414034940) on ubuntu-latest, macos-latest, and windows-latest × Python 3.9, 3.12, and 3.14 (`.github/workflows/ci.yml`).
 
 FFmpeg/ffprobe are external runtime dependencies: they are not bundled with and are not installed by this project. FFmpeg needs libx264 and AAC encoders. This project does not upload files or require a cloud account. Install dependencies separately using your preferred platform tools if they are missing.
@@ -43,6 +44,17 @@ python3 prep_video.py "/path/to/input.mp4" \
 The output directory must not already exist, including an empty directory. Its parent must exist. Omit `-o` for a new, uniquely named folder next to the input. Interrupted runs are not resumed; select a new output directory.
 
 Defaults are at most 120 seconds per clip, maximum height 1080, 5000 kb/s video, 30 fps H.264/yuv420p, and AAC 96 kb/s if source audio exists. Smaller source videos are not upscaled. Portrait orientation is retained and output dimensions are even. Anamorphic input is normalized to square pixels.
+
+### Color range and HDR
+
+Output is always limited-range (`tv`) yuv420p. Color primaries, transfer, and matrix tags are carried through, never invented or overwritten. The range policy is decided before encoding and recorded under `color` in `manifest.json`:
+
+- **Full range** (`yuvj*` pixel format or `color_range=pc`, e.g. iPhone screen recordings): pixels are converted by the scaler (0/255 → 16/235), then tagged `tv`. Previously these clips came out as `yuvj420p`/`pc` and failed validation.
+- **Limited range** (`tv`): passed through, not converted twice.
+- **Unspecified range** on YUV input: treated as limited, which is both the H.264/HEVC default and how FFmpeg's scaler interprets it. A NOTE is printed and the policy is recorded.
+- **RGB input**: converted to limited-range YUV.
+- **Conflicting tags** (for example `yuvj420p` with `color_range=tv`, or stream tags that disagree with the decoded first frame): rejected before any output folder is created.
+- **HDR** (PQ/SMPTE 2084, HLG/ARIB STD-B67, or mastering-display/content-light/Dolby Vision side data): rejected before any output folder is created. Tone mapping is not implemented; export an SDR (BT.709) version first.
 
 1080/5000 defaults help preserve small HUD text and provide bitrate for the extra pixels. Inspect a sample for legibility; a size limit cannot guarantee readable detail. Original low-resolution text cannot be recovered. For the former resolution/bitrate choice:
 
@@ -81,9 +93,9 @@ All planned intervals are contiguous `[start, end)` ranges. The final end is the
 
 Re-encoding and 30 fps rounding are not frame-exact lossless cuts. Boundary frames can be repeated or excluded. Video duration must remain within two frames plus 20 ms of the plan; the MP4 container may run up to 150 ms longer due to AAC padding. Both video and container durations are recorded. This mapping supports review, not forensic or frame-accurate timecode certification.
 
-Every accepted clip is checked for strict byte size, H.264/yuv420p/even dimensions, 30 fps, duration, faststart box order, and full video/audio decoding. A verified temporary file is atomically linked to its final filename without overwriting an existing destination. The source hash is checked again at completion.
+Every accepted clip is checked for strict byte size, H.264/yuv420p/limited range/even dimensions, unchanged SDR color tags, 30 fps, duration, faststart box order, and full video/audio decoding. A verified temporary file is atomically linked to its final filename without overwriting an existing destination. The source hash is checked again at completion.
 
-On failure, completed clips are retained with `status: failed` and `ERROR.txt`; no DONE is created. A hard interruption can leave `running` metadata or temporary files. Never treat a directory without DONE as complete. Keep metadata private when it contains source paths or source tags. The tool does not upload anything.
+On failure, completed clips are retained with `status: failed` and `ERROR.txt`; no DONE is created. Validation errors list the observed `codec_name`/`pix_fmt`/`width`/`height`/`color_range` and the failed conditions; `manifest.json` keeps them under `diagnostics.failure`, along with the invocation (`diagnostics.argv`), the last FFmpeg command, and the tool paths. A hard interruption can leave `running` metadata or temporary files. Never treat a directory without DONE as complete. Keep metadata private when it contains source paths or source tags. The tool does not upload anything.
 
 ## Tests
 
@@ -91,7 +103,7 @@ On failure, completed clips are retained with `status: failed` and `ERROR.txt`; 
 PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py
 ```
 
-On Windows or a different environment, choose a writable cache path or omit the environment assignment. Tests create tiny synthetic inputs and preserve results under `test_artifacts/`. Successful paths use real FFmpeg/ffprobe. Certain oversize, timeout, missing-tool, and validation-failure cases use explicit mocks. Tests cover audio/no audio, delayed/short audio, delayed-video rejection, odd dimensions, portrait, one-frame clips, decimal/binary caps, strict size-cap and duration boundaries, silent inputs recorded as audio absent, Korean/space paths, collisions, bounded retries/floors, interruption without DONE, corrupted media, and final-metadata failure without DONE.
+On Windows or a different environment, choose a writable cache path or omit the environment assignment. Tests create tiny synthetic inputs and preserve results under `test_artifacts/`. Successful paths use real FFmpeg/ffprobe. Certain oversize, timeout, missing-tool, and validation-failure cases use explicit mocks. Tests cover audio/no audio, delayed/short audio, delayed-video rejection, odd dimensions, portrait, rotation 90, full/limited/unspecified color range (black/white pixel levels checked within ±3), a reproduction of the pre-fix full-range failure, HDR rejection, conflicting color tags, missing FFmpeg filters, one-frame clips, decimal/binary caps, strict size-cap and duration boundaries, silent inputs recorded as audio absent, Korean/space paths, collisions, bounded retries/floors, interruption without DONE, corrupted media, and final-metadata failure without DONE.
 
 ## License
 
