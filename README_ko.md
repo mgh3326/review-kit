@@ -1,4 +1,4 @@
-# GPT 영상 검토용 분할 도구
+# review-kit: 검토 자료 준비·패키지·공유
 
 `prep_video.py`는 원본을 읽어서 검토용 H.264/AAC MP4 조각을 새 폴더에 만듭니다. Python 표준 라이브러리와 이미 설치된 `ffmpeg`, `ffprobe`만 사용합니다. 설치·외부 업로드·원본 덮어쓰기는 하지 않습니다. 기존 `prep_video.py`를 교체하지 말고 이 파일을 별도 위치에서 실행하세요.
 
@@ -6,7 +6,103 @@
 # 선택: 패키지로 설치하면 prep-video 명령이 PATH에 생깁니다.
 python3 -m pip install .
 prep-video --help
+review-kit --help
 ```
+
+## 검토 자료 흐름
+
+전체 흐름은 **준비 → 패키지 구성 → 공유 → 검수자가 INDEX.md 확인 → done으로 삭제**입니다. 기존 `prep_video.py`와 `prep-video` 명령, 출력 형식은 그대로 사용할 수 있습니다.
+
+### 패키지 구성
+
+영상은 기존 분할 도구로 바로 준비하거나, `review-kit package`로 영상 조각·스틸 이미지·검수 요청 안내를 한 폴더에 모을 수 있습니다.
+
+```bash
+review-kit package ./review-package \
+  --video ./recording.mp4 \
+  --still ./screenshots/screen-01.png \
+  --title "변경 사항 검수" \
+  --context "검토할 동작과 변경 내용을 적습니다." \
+  --check "화면에 보이는 상태와 문구를 확인해 주세요." \
+  --check "녹화된 흐름에서 회귀가 있는지 확인해 주세요."
+```
+
+패키지에는 `README_review_request.md`, `videos/`의 검증된 분할 결과, `stills/`의 이미지가 들어갑니다. 영상 조각은 기본적으로 파일마다 **십진 45 MB 미만**으로 만듭니다. `--max-mb`로 변경할 수 있습니다. 동영상 패키징에는 FFmpeg/ffprobe가 필요하고, 출력 폴더는 미리 존재하면 안 됩니다. 영상 변환 manifest에는 원본 경로와 ffprobe 메타데이터가 포함되므로 공유 전에 패키지 내용을 확인하세요.
+
+### 프로필과 저장소 설정
+
+프로필은 `~/.config/review-kit/<프로필>.env`의 `KEY=VALUE` 형식 파일입니다. `review-kit --profile <프로필> ...` 또는 `REVIEW_KIT_PROFILE`로 선택합니다. 환경 변수로 값과 자격 증명을 지정할 수도 있습니다. `SUPABASE_ENV_FILE`은 기존 별도 env 파일을 읽으며 셸 명령을 실행하지 않습니다.
+
+Supabase 프로필 예시(자리표시자):
+
+```ini
+BACKEND=supabase
+SUPABASE_BUCKET=<PRIVATE_BUCKET>
+SUPABASE_ENV_FILE=/path/to/existing/supabase-credentials.env
+```
+
+참조하는 파일에 `SUPABASE_URL`과 `SUPABASE_SECRET_KEY`(또는 `SUPABASE_SERVICE_KEY`)를 둡니다. 설정·자격 증명 파일은 저장소 외부에 보관하고 접근 권한을 제한하세요.
+
+일반 S3 호환 프로필:
+
+```ini
+BACKEND=s3
+S3_ENDPOINT=<HTTPS_ENDPOINT>
+S3_REGION=<PROVIDER_REGION>
+S3_BUCKET=<PRIVATE_BUCKET>
+S3_ACCESS_KEY_ID=<ACCESS_KEY_ID>
+S3_SECRET_ACCESS_KEY=<SECRET_ACCESS_KEY>
+S3_ADDRESSING_STYLE=path
+```
+
+`S3_ENDPOINT`는 서비스 엔드포인트, `S3_REGION`은 SigV4 리전입니다. 주소 방식은 `path` 또는 `virtual`이며 기본값은 `path`입니다.
+
+| 제공자 | 엔드포인트·리전 설정 | 주소 방식 |
+|---|---|---|
+| Cloudflare R2 | `S3_ENDPOINT=<R2_ACCOUNT_ENDPOINT_URL>`, 리전 `auto` | `path` 지원 |
+| Oracle Cloud Infrastructure Object Storage | `S3_ENDPOINT=<OCI_S3_COMPATIBILITY_ENDPOINT>`; `S3_REGION`은 엔드포인트에 포함된 OCI 리전 식별자와 동일 | 네임스페이스 엔드포인트는 `path`; OCI의 virtual-host 호환 엔드포인트도 선택 가능 |
+| NAVER Cloud Platform Object Storage | `S3_ENDPOINT=<NCP_REGIONAL_OBJECT_STORAGE_ENDPOINT>`; `S3_REGION`은 선택한 지역 코드. 현재 문서의 region name: `kr-standard`, `us-standard`, `sg-standard`, `jp-standard`, `de-standard` | 우선 `path` 사용 |
+
+S3 클라이언트는 SigV4 요청과 서명된 GET 링크를 지원합니다. R2는 이 저장소에서 실제 왕복 확인을 합니다. OCI와 NCP는 설정을 문서화했으며 실제 연결 검증은 하지 않았습니다.
+
+공식 엔드포인트 문서: [Cloudflare R2 S3 호환성](https://developers.cloudflare.com/r2/api/s3/api/), [OCI S3 호환성](https://docs.oracle.com/en-us/iaas/Content/Object/Tasks/s3compatibleapi.htm), [NAVER Cloud Object Storage 리전별 엔드포인트](https://api.ncloud-docs.com/docs/en/storage-objectstorage).
+
+### Drive 우선 공유, 보관, 재서명
+
+호출 측에서 Drive 검색을 수행하고 상대 경로와 기존 Drive URL의 매핑 JSON을 전달할 수 있습니다. `review-kit`은 Drive에 연결하지 않습니다. 매핑에 있는 파일은 업로드하지 않고 Drive URL로 연결하며, 없는 파일만 선택한 저장소로 업로드합니다. 폴더의 모든 파일이 매핑되어 있으면 `INDEX.md`만 업로드합니다. 폴더 단위 링크는 INDEX 맨 위에 선택적으로 넣을 수 있습니다.
+
+```bash
+review-kit --profile work share upload ./review-package pa-review-123 \
+  --days 7 \
+  --drive-manifest ./drive-manifest.json \
+  --drive-folder-url "<DRIVE_FOLDER_URL>"
+```
+
+매니페스트 형식:
+
+```json
+{
+  "README_review_request.md": "<DRIVE_FILE_URL>",
+  "stills/screen-01.png": "<DRIVE_FILE_URL>"
+}
+```
+
+`INDEX.md`에는 상대 파일 경로, 바이트 크기, 로컬 SHA256, 출처(`drive` 또는 `storage`), 링크와 만료 날짜가 들어갑니다. 명령은 INDEX의 서명된 링크를 출력합니다. 링크를 가진 사람은 유효 기간 동안 파일을 읽을 수 있으므로 지정된 검수자에게만 전달하세요. 서명 링크 유효 기간은 1~7일이며, 만료되어도 저장 파일은 자동 삭제되지 않습니다.
+
+```bash
+review-kit status                       # 저장소 사용량 및 패키지 상태
+review-kit ls [prefix]                  # 원격 객체 목록
+review-kit prune --dry-run              # 용량 초과 시 삭제 대상 미리보기
+review-kit prune                        # high-water 초과 시 오래된 패키지 삭제
+review-kit resign pa-review-123         # 파일 재업로드 없이 링크와 INDEX 갱신
+review-kit done pa-review-123           # 검수 종료 후 명시적으로 삭제
+```
+
+보관 기준은 링크 만료가 아니라 저장소 용량입니다. `prune`은 전체 사용량이 high-water 이하일 때는 삭제하지 않습니다. 초과하면 업로드가 가장 오래된 추적 패키지부터 low-water까지 지웁니다. 기본값은 1 GB 버킷 기준 **high 900 MB / low 700 MB**(십진 MB)입니다. 프로필의 `PRUNE_HIGH_WATER_MB`, `PRUNE_LOW_WATER_MB`로 설정하며 `prune --high-water-mb`와 `--low-water-mb`로 명령별 재정의도 가능합니다. `share upload`도 업로드 전에 같은 용량 정리를 실행합니다.
+
+원장은 기본적으로 프로필 옆 `<프로필>.ledger.json`에 원자적으로 기록되며 `LEDGER_PATH`로 경로를 바꿀 수 있습니다. 저장소에 업로드한 정확한 객체 키와 파일 SHA256만 정리 대상으로 기록합니다. `done`과 `prune`은 Drive 파일이나 원장에 없는 버킷 객체를 삭제하지 않습니다. 보관 중인 패키지 링크가 만료되면 `resign`이 원장의 SHA256과 저장 객체 메타데이터를 비교한 뒤 새 GET 링크를 서명하고 INDEX를 갱신합니다. 파일은 다시 업로드하지 않으며 최초 업로드 날짜도 유지해 오래된 순서가 바뀌지 않습니다.
+
+`status`는 800 MB를 넘으면 경고를 표시합니다.
 
 ## 빠른 시작
 
@@ -111,10 +207,12 @@ python3 prep_video.py recording.mp4 --min-vkbps 2500 --vkbps 5000
 ## 테스트
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py
+PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py && python3 test_review_kit.py
 ```
 
 설치된 FFmpeg로 0.017~1.4초 합성 영상을 생성합니다. 실제 기기 녹음이 아니며 생성 오디오는 테스트에서 `reconstructed`로 표기합니다. 음성/무음·홀수 크기·세로·회전 90·전체/제한/미지정 색 범위(흑/백 픽셀 값 ±3 검사)·수정 전 전체 범위 실패 재현·HDR 거부·색 태그 충돌·필터 부재·초단편·십진/이진 바이트 제한·입력 오류·도구 부재·출력 충돌·손상/시간 초과·검증 실패·재시도 상한/복구를 검사합니다. 재시도 크기 초과·디코딩 실패·시간 초과는 결정적인 검증을 위해 일부 함수를 모의 처리하며, 정상 변환·디코딩·크기/해시 검사는 실제 도구를 사용합니다. 결과는 `test_artifacts/test_results.json`, 로그와 합성 산출물로 남습니다. 원본 실영상 전체를 인코딩하지 않습니다.
+
+`test_review_kit.py`는 네트워크 없이 가짜 저장소를 사용합니다. Drive/스토리지 혼합 INDEX, Drive 전용 패키지, 원장 정리, 용량 기준 오래된 순서의 prune, 파일 재업로드 없는 resign, 안전한 객체 키, AWS 공개 SigV4 서명을 검사합니다.
 
 이 도구가 플랫폼의 영상 업로드·재생·모델의 영상 이해 능력을 보장하지는 않습니다. 짧은 조각, 원본 시간표, 선택 썸네일이 검토 근거를 추적하기 쉽게 만듭니다.
 
@@ -132,4 +230,4 @@ python3 prep_video.py "/path/to/input.mp4" \
 
 ## 개발·플랫폼 검증
 
-색 범위 수정 후 로컬 테스트 통과 환경: Apple Silicon Mac(arm64), macOS 27.0.1, Python 3.14.7, FFmpeg/ffprobe 9.0.2(Homebrew). 같은 환경에서 245.7초 전체 범위(`yuvj420p`/`pc`, BT.709, 회전 90) HEVC 화면 녹화를 기존 CLI 옵션 그대로 3개 조각까지 끝까지 처리·검증했습니다. **Intel Mac(x86_64)은 색 범위 수정 후 아직 재검증하지 않았습니다.** 수정 전 코드는 Intel Mac, macOS 26.6.2, Python 3.9.6, FFmpeg/ffprobe 8.1에서 테스트를 통과했습니다. CI의 `macos-latest`는 Apple Silicon이므로 Intel 검증이 아닙니다. CI는 ubuntu-latest·macos-latest·windows-latest × Python 3.9/3.12/3.14 전체 9개 잡이 run [39414034940](https://github.com/mgh3326/video-review-kit/actions/runs/39414034940)에서 통과했습니다(`.github/workflows/ci.yml`). FFmpeg/ffprobe는 별도 외부 런타임 의존성이며 이 도구가 자동 설치하거나 프로젝트에 포함(번들)하지 않습니다. Python 외부 패키지는 필요하지 않습니다. 정상 출력은 실제 FFmpeg로 검사하고, 크기 초과·시간 초과·일부 검증 실패는 명시적으로 모의 주입합니다. 오디오 지연, 영상보다 먼저 끝나는 오디오, 한국어·공백 경로, 하한과 최종 메타데이터 실패도 검사합니다.
+색 범위 수정 후 로컬 테스트 통과 환경: Apple Silicon Mac(arm64), macOS 27.0.1, Python 3.14.7, FFmpeg/ffprobe 9.0.2(Homebrew). 같은 환경에서 245.7초 전체 범위(`yuvj420p`/`pc`, BT.709, 회전 90) HEVC 화면 녹화를 기존 CLI 옵션 그대로 3개 조각까지 끝까지 처리·검증했습니다. **Intel Mac(x86_64)은 색 범위 수정 후 아직 재검증하지 않았습니다.** 수정 전 코드는 Intel Mac, macOS 26.6.2, Python 3.9.6, FFmpeg/ffprobe 8.1에서 테스트를 통과했습니다. CI의 `macos-latest`는 Apple Silicon이므로 Intel 검증이 아닙니다. CI는 ubuntu-latest·macos-latest·windows-latest × Python 3.9/3.12/3.14 전체 9개 잡이 run [39414034940](https://github.com/mgh3326/review-kit/actions/runs/39414034940)에서 통과했습니다(`.github/workflows/ci.yml`). FFmpeg/ffprobe는 별도 외부 런타임 의존성이며 이 도구가 자동 설치하거나 프로젝트에 포함(번들)하지 않습니다. Python 외부 패키지는 필요하지 않습니다. 정상 출력은 실제 FFmpeg로 검사하고, 크기 초과·시간 초과·일부 검증 실패는 명시적으로 모의 주입합니다. 오디오 지연, 영상보다 먼저 끝나는 오디오, 한국어·공백 경로, 하한과 최종 메타데이터 실패도 검사합니다.
