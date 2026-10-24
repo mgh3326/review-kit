@@ -158,6 +158,14 @@ def save_ledger(path, ledger):
             os.unlink(temporary_name)
 
 
+def _check_record_backend(backend, record):
+    """Refuse to operate on a package recorded for a different backend."""
+    recorded = record.get("backend")
+    if recorded is not None and recorded != getattr(backend, "name", None):
+        raise RuntimeError("Package belongs to backend %s; select that backend explicitly" %
+                           recorded)
+
+
 def build_index(prefix, expiry_date, rows, drive_folder_url=None):
     """Build the Markdown INDEX contents from already signed row links."""
     lines = ["# %s — review files (links valid until %s)" % (prefix, expiry_date), ""]
@@ -191,6 +199,9 @@ def prune_packages(backend, ledger_path, dry_run=False, now=None,
 
     packages = []
     for prefix, record in ledger["packages"].items():
+        recorded_backend = record.get("backend")
+        if recorded_backend is not None and recorded_backend != getattr(backend, "name", None):
+            continue
         try:
             uploaded = dt.datetime.fromisoformat(record["uploaded"])
             if uploaded.tzinfo is None:
@@ -316,6 +327,7 @@ def resign_package(backend, ledger_path, prefix, days=7, now=None):
     record = ledger["packages"].get(prefix_key)
     if record is None:
         raise ValueError("No tracked package with that prefix")
+    _check_record_backend(backend, record)
     if not isinstance(record.get("files"), list):
         raise ValueError("Package ledger lacks file details required to re-sign")
     now = now or utc_now()
@@ -361,6 +373,7 @@ def done_package(backend, ledger_path, prefix):
     record = ledger["packages"].get(prefix_key)
     if record is None:
         raise ValueError("No tracked package with that prefix")
+    _check_record_backend(backend, record)
     keys = [obj["key"] for obj in record.get("objects", [])
             if isinstance(obj, dict) and isinstance(obj.get("key"), str)]
     if keys:

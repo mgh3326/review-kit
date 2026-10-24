@@ -98,6 +98,8 @@ review-kit resign pa-review-123         # 파일 재업로드 없이 링크와 I
 review-kit done pa-review-123           # 검수 종료 후 명시적으로 삭제
 ```
 
+`--backend supabase|s3`는 저장소를 조회하거나 관리하는 명령의 전역 옵션입니다. 명령 앞에 둡니다(`review-kit --backend s3 done pa-review-123`). `share upload`은 prefix 뒤에 두는 기존 위치도 지원합니다. 삭제와 재서명은 실행 전 원장의 저장소 종류를 확인합니다. 용량 정리는 선택한 저장소에 기록된 패키지만 대상으로 하며, backend 필드가 없는 기존 원장 기록은 현재 선택한 저장소로 처리합니다.
+
 보관 기준은 링크 만료가 아니라 저장소 용량입니다. `prune`은 전체 사용량이 high-water 이하일 때는 삭제하지 않습니다. 초과하면 업로드가 가장 오래된 추적 패키지부터 low-water까지 지웁니다. 기본값은 1 GB 버킷 기준 **high 900 MB / low 700 MB**(십진 MB)입니다. 프로필의 `PRUNE_HIGH_WATER_MB`, `PRUNE_LOW_WATER_MB`로 설정하며 `prune --high-water-mb`와 `--low-water-mb`로 명령별 재정의도 가능합니다. `share upload`도 업로드 전에 같은 용량 정리를 실행합니다.
 
 원장은 기본적으로 프로필 옆 `<프로필>.ledger.json`에 원자적으로 기록되며 `LEDGER_PATH`로 경로를 바꿀 수 있습니다. 저장소에 업로드한 정확한 객체 키와 파일 SHA256만 정리 대상으로 기록합니다. `done`과 `prune`은 Drive 파일이나 원장에 없는 버킷 객체를 삭제하지 않습니다. 보관 중인 패키지 링크가 만료되면 `resign`이 원장의 SHA256과 저장 객체 메타데이터를 비교한 뒤 새 GET 링크를 서명하고 INDEX를 갱신합니다. 파일은 다시 업로드하지 않으며 최초 업로드 날짜도 유지해 오래된 순서가 바뀌지 않습니다.

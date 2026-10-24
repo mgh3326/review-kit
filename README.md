@@ -125,6 +125,8 @@ review-kit resign pa-review-123   # refresh signed links without re-uploading fi
 review-kit done pa-review-123     # delete this package after review
 ```
 
+`--backend supabase|s3` is a global option for commands that inspect or manage a backend. Put it before the command (`review-kit --backend s3 done pa-review-123`); `share upload` also accepts it after the prefix. Cleanup and re-sign commands verify the ledger's recorded backend before acting. Capacity pruning only considers tracked packages for the selected backend; records without a backend field use the selected backend for compatibility.
+
 Expiry applies to links; it does not delete stored files. Retention is based on bucket capacity. `prune` does nothing at or below the high-water mark; above it, it removes the oldest tracked packages until usage reaches the low-water mark. Defaults are **900 MB high / 700 MB low** (decimal MB) for a 1 GB bucket. Set `PRUNE_HIGH_WATER_MB` and `PRUNE_LOW_WATER_MB` in the profile, or override them on the `prune` command. `share upload` runs this capacity check before uploading.
 
 The ledger is JSON beside the selected profile by default (`<profile>.ledger.json`); set `LEDGER_PATH` to move it. Ledger writes are atomic. It records the exact storage objects and file hashes; `done` and `prune` only delete objects in those records, never Drive files or untracked bucket content. `status` warns above 800 MB. When a kept package's links expire, `resign` checks each stored object's SHA256 metadata against the ledger, signs fresh GET links, updates INDEX.md, and updates the expiry date without uploading unchanged package files. It preserves the original upload date used for oldest-first retention.

@@ -29,6 +29,8 @@ def _parser():
     parser.add_argument("--profile", default=os.environ.get("REVIEW_KIT_PROFILE", "default"),
                         help="profile name under ~/.config/review-kit (or set REVIEW_KIT_PROFILE)")
     parser.add_argument("--config", help="explicit profile .env file")
+    parser.add_argument("--backend", choices=("supabase", "s3"),
+                        help="select a storage backend for this command")
     commands = parser.add_subparsers(dest="command", required=True)
 
     share = commands.add_parser("share", help="share review material")
@@ -37,7 +39,9 @@ def _parser():
     upload.add_argument("directory", type=Path)
     upload.add_argument("prefix")
     upload.add_argument("--days", type=int, default=7)
-    upload.add_argument("--backend", choices=("supabase", "s3"))
+    # Keep the upload-local spelling from the original interface while also
+    # allowing the global option for cleanup and inspection commands.
+    upload.add_argument("--backend", dest="upload_backend", choices=("supabase", "s3"))
     upload.add_argument("--drive-manifest", help="JSON mapping relative file paths to Drive URLs")
     upload.add_argument("--drive-folder-url", "--drive-url", dest="drive_folder_url",
                         help="folder-level Drive URL included at the top of INDEX.md")
@@ -72,7 +76,9 @@ def _parser():
 
 def _backend_and_ledger(args):
     config = load_config(args.profile, args.config)
-    backend = create_backend(config, getattr(args, "backend", None))
+    selected = (getattr(args, "upload_backend", None) or
+                getattr(args, "backend", None))
+    backend = create_backend(config, selected)
     return config, backend, config["_LEDGER_PATH"]
 
 
@@ -109,7 +115,8 @@ def main(argv=None):
             high_bytes, low_bytes = _retention_limits(config)
             result = upload_folder(args.directory, args.prefix, args.days, backend, ledger_path,
                                    manifest, args.drive_folder_url,
-                                   backend_name=args.backend or config.get("BACKEND", "supabase"),
+                                   backend_name=(args.upload_backend or args.backend or
+                                                 config.get("BACKEND", "supabase")),
                                    high_water_bytes=high_bytes, low_water_bytes=low_bytes)
             print(result["index_url"])
             return 0

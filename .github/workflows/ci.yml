@@ -35,6 +35,7 @@ jobs:
             ForEach-Object { $_.FullName } | Out-File -Append $env:GITHUB_PATH
 
       - name: Run tests
+        shell: bash
         run: |
           python test_prep_video.py
           python test_review_kit.py

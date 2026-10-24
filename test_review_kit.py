@@ -173,6 +173,40 @@ class ShareTests(unittest.TestCase):
                                         high_water_bytes=900_000_000,
                                         low_water_bytes=700_000_000), [])
 
+    def test_prune_skips_packages_from_another_backend(self):
+        old = dt.datetime(2026, 10, 19, 0, 0, tzinfo=dt.timezone.utc)
+        current = dt.datetime(2026, 10, 20, 0, 0, tzinfo=dt.timezone.utc)
+        save_ledger(self.ledger, {"schema_version": 1, "packages": {
+            "other-backend": {"uploaded": old.isoformat(), "backend": "s3",
+                               "objects": [{"key": "other-backend/INDEX.md"}]},
+            "current": {"uploaded": current.isoformat(),
+                        "objects": [{"key": "current/INDEX.md"}]},
+        }})
+        self.backend.objects["other-backend/INDEX.md"] = (b"other", "hash")
+        self.backend.objects["current/INDEX.md"] = (b"current", "hash")
+        self.backend.objects["untracked"] = (b"untracked", "hash")
+        self.backend.size_overrides = {"other-backend/INDEX.md": 100_000_000,
+                                       "current/INDEX.md": 250_000_000,
+                                       "untracked": 600_000_000}
+        removed = prune_packages(self.backend, self.ledger,
+                                 high_water_bytes=900_000_000,
+                                 low_water_bytes=700_000_000)
+        self.assertEqual([item[0] for item in removed], ["current"])
+        self.assertIn("other-backend/INDEX.md", self.backend.objects)
+        self.assertEqual(set(load_ledger(self.ledger)["packages"]), {"other-backend"})
+
+    def test_done_and_resign_reject_a_different_recorded_backend(self):
+        upload_folder(self.folder, "kept", 1, self.backend, self.ledger)
+        ledger = load_ledger(self.ledger)
+        ledger["packages"]["kept"]["backend"] = "s3"
+        save_ledger(self.ledger, ledger)
+        keys_before = set(self.backend.objects)
+        with self.assertRaisesRegex(RuntimeError, "belongs to backend s3"):
+            done_package(self.backend, self.ledger, "kept")
+        with self.assertRaisesRegex(RuntimeError, "belongs to backend s3"):
+            resign_package(self.backend, self.ledger, "kept")
+        self.assertEqual(set(self.backend.objects), keys_before)
+
     def test_resign_refreshes_links_without_reupload_and_checks_hash(self):
         original_upload = dt.datetime(2026, 10, 24, 0, 0, tzinfo=dt.timezone.utc)
         result = upload_folder(
