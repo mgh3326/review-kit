@@ -1,26 +1,28 @@
-# video-review-kit
+# review-kit
 
-Split a recorded video into short, size-limited MP4 files with traceable timestamps for review. The original stays untouched. Encoding uses installed FFmpeg tools; Python handles planning, checks, and metadata. A Rust wrapper is unnecessary for the current scope because FFmpeg performs the intensive media work.
+Prepare, package, and share review material. `prep_video.py` remains available for creating short, size-limited MP4 parts with traceable timestamps; the new `review-kit` command can assemble review folders and share them through private storage with expiring links.
 
 [한국어 사용 설명서](README_ko.md)
 
 ## Requirements
 
 - Python 3.9 or newer, standard library only.
-- `ffmpeg` and `ffprobe` on PATH (found via PATH, never a hard-coded install directory), with libx264 and AAC encoders and the `scale` (with `in_range`/`out_range`), `setsar`, `fps`, `format`, and `setparams` filters. Missing capabilities fail before any output is written. Encoding is always software libx264; the same command works on Apple Silicon and Intel Macs, with no CPU-specific options.
-- A local output filesystem supporting hard links for atomic, no-overwrite finalization.
+- `ffmpeg` and `ffprobe` are needed only when preparing videos. They must be on PATH with libx264 and AAC encoders and the `scale` (with `in_range`/`out_range`), `setsar`, `fps`, `format`, and `setparams` filters. Encoding is always software libx264.
+- For video output, a local filesystem supporting hard links for atomic, no-overwrite finalization.
+
+Sharing uses the Python standard library and does not need FFmpeg. Configure a private Supabase Storage bucket or S3-compatible object store before using upload, status, listing, cleanup, or signing commands.
 
 OS support — exactly what has been verified:
 
 - **macOS Apple Silicon (arm64): tests pass locally** with the color-range fix — macOS 27.0.1, Python 3.14.7, FFmpeg/ffprobe 9.0.2 (Homebrew). A real 245.7 s full-range (`yuvj420p`/`pc`, BT.709, rotation 90) HEVC screen recording was also processed end to end into 3 validated clips.
 - **macOS Intel (x86_64): not yet re-verified with the color-range fix.** Earlier code (before the fix) passed tests on macOS 26.6.2, Python 3.9.6, FFmpeg/ffprobe 8.1. CI's `macos-latest` runner is Apple Silicon, so CI does not cover Intel.
-- **CI: all 9 matrix jobs green** in run [39414034940](https://github.com/mgh3326/video-review-kit/actions/runs/39414034940) on ubuntu-latest, macos-latest, and windows-latest × Python 3.9, 3.12, and 3.14 (`.github/workflows/ci.yml`).
+- **CI: all 9 matrix jobs green** in run [39414034940](https://github.com/mgh3326/review-kit/actions/runs/39414034940) on ubuntu-latest, macos-latest, and windows-latest × Python 3.9, 3.12, and 3.14 (`.github/workflows/ci.yml`).
 
-FFmpeg/ffprobe are external runtime dependencies: they are not bundled with and are not installed by this project. FFmpeg needs libx264 and AAC encoders. This project does not upload files or require a cloud account. Install dependencies separately using your preferred platform tools if they are missing.
+FFmpeg/ffprobe are external runtime dependencies for video preparation: they are not bundled with and are not installed by this project. FFmpeg needs libx264 and AAC encoders. Upload and signing use the standard library and require a configured storage account.
 
 ## Install
 
-The script has no third-party Python dependencies, so you can run it in place:
+The tools have no third-party Python dependencies, so you can run the video splitter in place:
 
 ```bash
 python3 prep_video.py --help
@@ -31,7 +33,105 @@ Or install the package to get the `prep-video` command on PATH:
 ```bash
 python3 -m pip install .
 prep-video --help
+review-kit --help
 ```
+
+## Review material workflow
+
+The full flow is **prepare → package → share → reviewer opens INDEX.md → done**. The original video-splitting CLI and its output files remain available.
+
+### Prepare and package
+
+Split a video directly with the existing command, or let `review-kit package` prepare videos and collect stills into one review folder:
+
+```bash
+review-kit package ./review-package \
+  --video ./recording.mp4 \
+  --still ./screenshots/screen-01.png \
+  --title "Review the latest change" \
+  --context "Describe the behavior and relevant change here." \
+  --check "Verify the visible states and text." \
+  --check "Look for regressions in the recorded flow."
+```
+
+The package contains `README_review_request.md`, a `videos/` directory with the validated `prep_video.py` outputs, and a `stills/` directory. Video parts use a strict decimal **45 MB** limit by default, below a 50 MB per-file limit; override it with `--max-mb`. Video packaging needs FFmpeg/ffprobe. Output directories must not already exist. Prepared video manifests contain the source path and probe metadata, so review the package contents before sharing.
+
+### Configure a profile
+
+Profiles are plain `KEY=VALUE` files at `~/.config/review-kit/<profile>.env`. Select one with `review-kit --profile <profile> ...` or `REVIEW_KIT_PROFILE`. Credentials can be supplied in environment variables. The optional `SUPABASE_ENV_FILE` setting imports a separate existing env file; no shell is evaluated.
+
+Supabase profile (placeholders only):
+
+```ini
+BACKEND=supabase
+SUPABASE_BUCKET=<PRIVATE_BUCKET>
+SUPABASE_ENV_FILE=/path/to/existing/supabase-credentials.env
+```
+
+The referenced credentials file provides `SUPABASE_URL` and `SUPABASE_SECRET_KEY` (or `SUPABASE_SERVICE_KEY`). Keep profile and credential files outside the repository and restrict their permissions. The Supabase API URL and bucket are profile settings.
+
+Generic S3-compatible profile:
+
+```ini
+BACKEND=s3
+S3_ENDPOINT=<HTTPS_ENDPOINT>
+S3_REGION=<PROVIDER_REGION>
+S3_BUCKET=<PRIVATE_BUCKET>
+S3_ACCESS_KEY_ID=<ACCESS_KEY_ID>
+S3_SECRET_ACCESS_KEY=<SECRET_ACCESS_KEY>
+S3_ADDRESSING_STYLE=path
+```
+
+`S3_ENDPOINT` is the service endpoint, and `S3_REGION` is its SigV4 region. `S3_ADDRESSING_STYLE` accepts `path` or `virtual`; the default is `path`.
+
+| Provider | Endpoint and region settings | Addressing |
+|---|---|---|
+| Cloudflare R2 | Set `S3_ENDPOINT=<R2_ACCOUNT_ENDPOINT_URL>` and `S3_REGION=auto`. | `path` works with the R2 S3 API. |
+| Oracle Cloud Infrastructure Object Storage | Set `S3_ENDPOINT=<OCI_S3_COMPATIBILITY_ENDPOINT>` and `S3_REGION` to the same OCI region identifier included in that endpoint. | The namespace endpoint uses `path`; OCI also offers a virtual-host compatibility endpoint. |
+| NAVER Cloud Platform Object Storage | Set `S3_ENDPOINT=<NCP_REGIONAL_OBJECT_STORAGE_ENDPOINT>` and use the matching region name (`kr-standard`, `us-standard`, `sg-standard`, `jp-standard`, or `de-standard`). | Start with `path`. |
+
+The S3 client signs requests with SigV4 and can create signed GET links. R2 is covered by the live check in this project; OCI and NCP settings are documented but have not been live-tested here.
+
+Provider endpoint references: [Cloudflare R2 S3 compatibility](https://developers.cloudflare.com/r2/api/s3/api/), [OCI S3 compatibility](https://docs.oracle.com/en-us/iaas/Content/Object/Tasks/s3compatibleapi.htm), and [NAVER Cloud Object Storage endpoints](https://api.ncloud-docs.com/docs/en/storage-objectstorage).
+
+### Share, read INDEX, and clean up
+
+The caller may search Google Drive and pass a JSON map of relative paths to existing Drive URLs. `review-kit` does not access Drive. A mapped file is linked directly and is not uploaded. Files missing from the map are uploaded to the selected storage backend. If every file is mapped, only `INDEX.md` is uploaded. An optional folder URL appears at the top of INDEX.
+
+```bash
+review-kit --profile work share upload ./review-package pa-review-123 \
+  --days 7 \
+  --drive-manifest ./drive-manifest.json \
+  --drive-folder-url "<DRIVE_FOLDER_URL>"
+```
+
+Example manifest shape:
+
+```json
+{
+  "README_review_request.md": "<DRIVE_FILE_URL>",
+  "stills/screen-01.png": "<DRIVE_FILE_URL>"
+}
+```
+
+`INDEX.md` lists each relative file, byte size, local SHA256, source (`drive` or `storage`), and link. It includes the expiry date and optional Drive folder link. The command prints a signed link to INDEX. Anyone who holds a signed link can read that file until the link expires; share the printed INDEX link only with the intended reviewer. Signed links expire after 1–7 days, but the stored objects do **not** expire or delete automatically.
+
+```bash
+review-kit status                 # storage use and tracked packages
+review-kit ls [prefix]            # remote object keys
+review-kit prune --dry-run        # preview oldest packages if above high water
+review-kit prune                  # reduce usage to low water when over high water
+review-kit resign pa-review-123   # refresh signed links without re-uploading files
+review-kit done pa-review-123     # delete this package after review
+```
+
+`--backend supabase|s3` is a global option for commands that inspect or manage a backend. Put it before the command (`review-kit --backend s3 done pa-review-123`); `share upload` also accepts it after the prefix. Cleanup and re-sign commands verify the ledger's recorded backend before acting. Capacity pruning only considers tracked packages for the selected backend; records without a backend field use the selected backend for compatibility.
+
+Expiry applies to links; it does not delete stored files. Retention is based on bucket capacity. `prune` does nothing at or below the high-water mark; above it, it removes the oldest tracked packages until usage reaches the low-water mark. Defaults are **900 MB high / 700 MB low** (decimal MB) for a 1 GB bucket. Set `PRUNE_HIGH_WATER_MB` and `PRUNE_LOW_WATER_MB` in the profile, or override them on the `prune` command. `share upload` runs this capacity check before uploading.
+
+The ledger is JSON beside the selected profile by default (`<profile>.ledger.json`); set `LEDGER_PATH` to move it. Ledger writes are atomic. It records the exact storage objects and file hashes; `done` and `prune` only delete objects in those records, never Drive files or untracked bucket content. `status` warns above 800 MB. When a kept package's links expire, `resign` checks each stored object's SHA256 metadata against the ledger, signs fresh GET links, updates INDEX.md, and updates the expiry date without uploading unchanged package files. It preserves the original upload date used for oldest-first retention.
+
+Upload refuses to overwrite any existing storage key unless its recorded SHA256 matches. Use a fresh prefix for each package; run `done` to remove an active package before reusing its prefix.
 
 ## Usage
 
@@ -100,11 +200,13 @@ On failure, completed clips are retained with `status: failed` and `ERROR.txt`; 
 ## Tests
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py
+PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py && python3 test_review_kit.py
 ```
 
 On Windows or a different environment, choose a writable cache path or omit the environment assignment. Tests create tiny synthetic inputs and preserve results under `test_artifacts/`. Successful paths use real FFmpeg/ffprobe. Certain oversize, timeout, missing-tool, and validation-failure cases use explicit mocks. Tests cover audio/no audio, delayed/short audio, delayed-video rejection, odd dimensions, portrait, rotation 90, full/limited/unspecified color range (black/white pixel levels checked within ±3), a reproduction of the pre-fix full-range failure, HDR rejection, conflicting color tags, missing FFmpeg filters, one-frame clips, decimal/binary caps, strict size-cap and duration boundaries, silent inputs recorded as audio absent, Korean/space paths, collisions, bounded retries/floors, interruption without DONE, corrupted media, and final-metadata failure without DONE.
 
+`test_review_kit.py` uses a fake backend and no network. It covers mixed Drive/storage INDEX rows, Drive-only packages, ledger cleanup, capacity-based oldest-first pruning, re-signing without package re-upload, safe object keys, and AWS-published SigV4 signatures.
+
 ## License
 
-MIT. See [LICENSE](LICENSE). No third-party code is vendored: the only code in this repository is `prep_video.py` and its test file, plus documentation. FFmpeg/ffprobe are external runtime dependencies with their own licenses; they are not distributed here.
+MIT. See [LICENSE](LICENSE). No third-party code is vendored. FFmpeg/ffprobe are external runtime dependencies with their own licenses; they are not distributed here.

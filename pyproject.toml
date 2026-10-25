@@ -3,14 +3,14 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "video-review-kit"
+name = "review-kit"
 version = "1.0.0"
-description = "Split a recorded video into size-limited, independently decodable MP4 review clips with traceable timestamps"
+description = "Prepare, package and share traceable review material"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
-authors = [{name = "video-review-kit contributors"}]
-keywords = ["ffmpeg", "video", "split", "review", "mp4"]
+authors = [{name = "review-kit contributors"}]
+keywords = ["ffmpeg", "video", "review", "sharing", "mp4"]
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: End Users/Desktop",
@@ -25,6 +25,8 @@ dependencies = []
 
 [project.scripts]
 prep-video = "prep_video:main"
+review-kit = "review_kit.cli:main"
 
 [tool.setuptools]
 py-modules = ["prep_video"]
+packages = ["review_kit"]

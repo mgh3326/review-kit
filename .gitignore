@@ -22,3 +22,6 @@ ERROR.txt
 *.m4a
 *.wav
 *.aac
+*.env
+*.ledger.json
+/review-package/
