@@ -9,6 +9,7 @@ from .backends import create_backend
 from .config import load_config
 from .share import (DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES, done_package,
                     package_status, prune_packages, resign_package, upload_folder)
+from .verify import verify_folder
 
 
 def _load_drive_manifest(path):
@@ -35,7 +36,7 @@ def _parser():
 
     share = commands.add_parser("share", help="share review material")
     share_commands = share.add_subparsers(dest="share_command", required=True)
-    upload = share_commands.add_parser("upload", help="upload files and create INDEX.md")
+    upload = share_commands.add_parser("upload", help="upload files and create INDEX.md and MANIFEST.json")
     upload.add_argument("directory", type=Path)
     upload.add_argument("prefix")
     upload.add_argument("--days", type=int, default=7)
@@ -45,6 +46,13 @@ def _parser():
     upload.add_argument("--drive-manifest", help="JSON mapping relative file paths to Drive URLs")
     upload.add_argument("--drive-folder-url", "--drive-url", dest="drive_folder_url",
                         help="folder-level Drive URL included at the top of INDEX.md")
+    upload.add_argument("--version", default="1",
+                        help="package version recorded in MANIFEST.json (default 1)")
+    upload.add_argument("--issue", help="issue id recorded in MANIFEST.json as issue_id")
+
+    verify = commands.add_parser("verify", help="check a downloaded folder against MANIFEST.json")
+    verify.add_argument("directory", type=Path)
+    verify.add_argument("manifest", type=Path)
 
     done = commands.add_parser("done", help="delete a tracked package after review")
     done.add_argument("prefix")
@@ -102,6 +110,20 @@ def _run_package(args):
     print("Package ready: %s" % output)
 
 
+def _run_verify(args):
+    result = verify_folder(args.directory, args.manifest)
+    for label, names in (("MISSING", result["missing"]), ("MISMATCH", result["mismatch"]),
+                         ("EXTRA", result["extra"])):
+        for name in names:
+            print("%s %s" % (label, name))
+    problems = len(result["missing"]) + len(result["mismatch"]) + len(result["extra"])
+    print("Checked %d files: %d ok, %d missing, %d mismatch, %d extra" %
+          (result["checked"], result["ok"], len(result["missing"]), len(result["mismatch"]),
+           len(result["extra"])))
+    print("OK" if not problems else "FAILED")
+    return 1 if problems else 0
+
+
 def main(argv=None):
     parser = _parser()
     args = parser.parse_args(argv)
@@ -109,6 +131,8 @@ def main(argv=None):
         if args.command == "package":
             _run_package(args)
             return 0
+        if args.command == "verify":
+            return _run_verify(args)
         config, backend, ledger_path = _backend_and_ledger(args)
         if args.command == "share" and args.share_command == "upload":
             manifest = _load_drive_manifest(args.drive_manifest)
@@ -117,7 +141,8 @@ def main(argv=None):
                                    manifest, args.drive_folder_url,
                                    backend_name=(args.upload_backend or args.backend or
                                                  config.get("BACKEND", "supabase")),
-                                   high_water_bytes=high_bytes, low_water_bytes=low_bytes)
+                                   high_water_bytes=high_bytes, low_water_bytes=low_bytes,
+                                   version=args.version, issue=args.issue)
             print(result["index_url"])
             return 0
         if args.command == "done":

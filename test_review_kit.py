@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -17,6 +18,7 @@ from review_kit.config import load_config
 from review_kit.package import assemble_package
 from review_kit.share import (done_package, load_ledger, prune_packages, resign_package,
                               safe_key, save_ledger, upload_folder)
+from review_kit.verify import verify_folder
 
 
 class FakeBackend:
@@ -115,18 +117,19 @@ class ShareTests(unittest.TestCase):
         ledger = load_ledger(self.ledger)
         record = ledger["packages"]["review-kit-selftest"]
         self.assertEqual([obj["file"] for obj in record["objects"]],
-                         ["README_검수요청.md", "storage.png", "INDEX.md"])
+                         ["README_검수요청.md", "storage.png", "MANIFEST.json", "INDEX.md"])
         self.assertEqual(record["drive_files"], 1)
         self.assertEqual(json.loads(self.ledger.read_text(encoding="utf-8")), ledger)
         self.assertEqual(list(self.root.glob("*.tmp")), [])
 
         self.backend.objects["2026-10-24c/protected.bin"] = (b"protected", "irrelevant")
         deleted = done_package(self.backend, self.ledger, "review-kit-selftest")
-        self.assertEqual(deleted, 3)
+        self.assertEqual(deleted, 4)
         self.assertIn("2026-10-24c/protected.bin", self.backend.objects)
         self.assertEqual(self.backend.deleted,
                          ["review-kit-selftest/README_review_request.md",
-                          "review-kit-selftest/storage.png", "review-kit-selftest/INDEX.md"])
+                          "review-kit-selftest/storage.png", "review-kit-selftest/MANIFEST.json",
+                          "review-kit-selftest/INDEX.md"])
         self.assertNotIn("review-kit-selftest", load_ledger(self.ledger)["packages"])
 
     def test_all_drive_files_uploads_only_index(self):
@@ -135,9 +138,10 @@ class ShareTests(unittest.TestCase):
             {"README_검수요청.md": "https://drive.google.com/file/d/request/view",
              "drive.png": "https://drive.google.com/file/d/image/view",
              "storage.png": "https://drive.google.com/file/d/other/view"})
-        self.assertEqual(sorted(self.backend.objects), ["drive-only/INDEX.md"])
+        self.assertEqual(sorted(self.backend.objects), ["drive-only/INDEX.md", "drive-only/MANIFEST.json"])
         record = load_ledger(self.ledger)["packages"]["drive-only"]
-        self.assertEqual([obj["key"] for obj in record["objects"]], ["drive-only/INDEX.md"])
+        self.assertEqual([obj["key"] for obj in record["objects"]],
+                         ["drive-only/MANIFEST.json", "drive-only/INDEX.md"])
         self.assertEqual(record["drive_files"], 3)
         self.assertEqual(len(result["rows"]), 3)
 
@@ -226,7 +230,7 @@ class ShareTests(unittest.TestCase):
                                    dt.datetime(2026, 10, 26, 0, 0, tzinfo=dt.timezone.utc))
         after = load_ledger(self.ledger)["packages"]["kept"]
         self.assertEqual(len(self.backend.puts), write_count)
-        self.assertEqual(self.backend.replacements, ["kept/INDEX.md"])
+        self.assertEqual(self.backend.replacements, ["kept/MANIFEST.json", "kept/INDEX.md"])
         self.assertEqual(before["uploaded"], after["uploaded"])
         self.assertEqual(after["expires"], "2026-10-29T00:00:00+00:00")
         self.assertEqual(resigned["record"]["expires"], after["expires"])
@@ -238,13 +242,190 @@ class ShareTests(unittest.TestCase):
         self.backend.objects[stored_key] = (b"changed", "changed-digest")
         with self.assertRaisesRegex(RuntimeError, "SHA256 does not match"):
             resign_package(self.backend, self.ledger, "kept", 2)
-        self.assertEqual(self.backend.replacements, ["kept/INDEX.md"])
+        self.assertEqual(self.backend.replacements, ["kept/MANIFEST.json", "kept/INDEX.md"])
 
     def test_drive_manifest_must_match_input_paths(self):
         with self.assertRaisesRegex(ValueError, "missing from the input folder"):
             upload_folder(self.folder, "bad-manifest", 7, self.backend, self.ledger,
                           {"missing.png": "https://drive.google.com/file/d/x/view"})
         self.assertEqual(self.backend.objects, {})
+
+    def _manifest(self, key):
+        return json.loads(self.backend.objects[key][0].decode("utf-8"))
+
+    def test_manifest_lists_every_file_and_is_linked_from_index(self):
+        now = dt.datetime(2026, 10, 24, 0, 0, tzinfo=dt.timezone.utc)
+        result = upload_folder(
+            self.folder, "pkg", 2, self.backend, self.ledger,
+            {"drive.png": "https://drive.google.com/file/d/drive-object/view"},
+            now=now, version="v3", issue="MGH-0")
+        manifest = self._manifest("pkg/MANIFEST.json")
+        self.assertEqual(json.loads(result["manifest"].decode("utf-8")), manifest)
+        self.assertEqual(manifest["schema"], "review-kit-manifest/1")
+        self.assertEqual((manifest["package_id"], manifest["version"], manifest["issue_id"]),
+                         ("pkg", "v3", "MGH-0"))
+        self.assertEqual(manifest["created_utc"], "2026-10-24T00:00:00Z")
+        self.assertEqual(manifest["expires_utc"], "2026-10-26T00:00:00Z")
+        files = {entry["relative_path"]: entry for entry in manifest["files"]}
+        self.assertEqual(sorted(files), ["README_검수요청.md", "drive.png", "storage.png"])
+        self.assertEqual(files["storage.png"], {
+            "relative_path": "storage.png", "bytes": 11,
+            "sha256": hashlib.sha256(b"upload this").hexdigest(), "source": "storage",
+            "url": "https://storage.example.test/pkg/storage.png?ttl=172800"})
+        self.assertEqual(files["drive.png"]["source"], "drive")
+        self.assertEqual(files["drive.png"]["url"], "https://drive.google.com/file/d/drive-object/view")
+        index = result["index"].decode("utf-8")
+        self.assertIn("Manifest: [MANIFEST.json](<https://storage.example.test/pkg/MANIFEST.json?ttl=172800>)",
+                      index)
+        self.assertNotIn("pkg/drive.png", self.backend.objects)
+        record = load_ledger(self.ledger)["packages"]["pkg"]
+        self.assertIn("MANIFEST.json", [obj["file"] for obj in record["objects"]])
+        self.assertEqual((record["version"], record["issue"]), ("v3", "MGH-0"))
+        # Cleanup covers the manifest too.
+        done_package(self.backend, self.ledger, "pkg")
+        self.assertNotIn("pkg/MANIFEST.json", self.backend.objects)
+
+    def test_manifest_defaults_and_label_validation(self):
+        upload_folder(self.folder, "plain", 1, self.backend, self.ledger)
+        manifest = self._manifest("plain/MANIFEST.json")
+        self.assertEqual((manifest["version"], manifest["issue_id"]), ("1", None))
+        for bad in ("two\nlines", "cr\rhere", "", "   ", "x" * 201, "tab\there"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                upload_folder(self.folder, "bad", 1, self.backend, self.ledger, version=bad)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                upload_folder(self.folder, "bad", 1, self.backend, self.ledger, issue=bad)
+        self.assertNotIn("bad/MANIFEST.json", self.backend.objects)
+
+    def test_input_folder_may_not_contain_a_manifest(self):
+        (self.folder / "MANIFEST.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "MANIFEST.json is generated"):
+            upload_folder(self.folder, "clash", 1, self.backend, self.ledger)
+        self.assertEqual(self.backend.objects, {})
+
+    def test_resign_refreshes_manifest_links_and_expiry(self):
+        original = dt.datetime(2026, 10, 24, 0, 0, tzinfo=dt.timezone.utc)
+        upload_folder(self.folder, "kept", 1, self.backend, self.ledger, now=original,
+                      version="2", issue="MGH-9")
+        before = self._manifest("kept/MANIFEST.json")
+        self.assertIn("ttl=86400", json.dumps(before))
+        resign_package(self.backend, self.ledger, "kept", 3,
+                       dt.datetime(2026, 10, 26, 0, 0, tzinfo=dt.timezone.utc))
+        after = self._manifest("kept/MANIFEST.json")
+        self.assertEqual(after["created_utc"], "2026-10-24T00:00:00Z")
+        self.assertEqual(after["expires_utc"], "2026-10-29T00:00:00Z")
+        self.assertEqual((after["version"], after["issue_id"]), ("2", "MGH-9"))
+        self.assertTrue(all(entry["url"].endswith("ttl=259200")
+                            for entry in after["files"] if entry["source"] == "storage"))
+        self.assertEqual([entry["sha256"] for entry in after["files"]],
+                         [entry["sha256"] for entry in before["files"]])
+        self.assertIn("kept/MANIFEST.json?ttl=259200",
+                      self.backend.objects["kept/INDEX.md"][0].decode("utf-8"))
+        recorded = [obj for obj in load_ledger(self.ledger)["packages"]["kept"]["objects"]
+                    if obj["file"] == "MANIFEST.json"]
+        self.assertEqual(len(recorded), 1)
+
+    def test_resign_adds_a_manifest_to_a_package_uploaded_without_one(self):
+        upload_folder(self.folder, "old", 1, self.backend, self.ledger)
+        self.backend.objects.pop("old/MANIFEST.json")
+        ledger = load_ledger(self.ledger)
+        record = ledger["packages"]["old"]
+        record["objects"] = [obj for obj in record["objects"] if obj["file"] != "MANIFEST.json"]
+        record.pop("version"), record.pop("issue")
+        save_ledger(self.ledger, ledger)
+        resign_package(self.backend, self.ledger, "old", 1)
+        manifest = self._manifest("old/MANIFEST.json")
+        self.assertEqual((manifest["version"], manifest["issue_id"]), ("1", None))
+        files = [obj["file"] for obj in load_ledger(self.ledger)["packages"]["old"]["objects"]]
+        self.assertIn("MANIFEST.json", files)
+        done_package(self.backend, self.ledger, "old")
+        self.assertNotIn("old/MANIFEST.json", self.backend.objects)
+
+
+class VerifyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        source = self.root / "source"
+        (source / "sub").mkdir(parents=True)
+        (source / "a.txt").write_bytes(b"alpha")
+        (source / "sub" / "b.bin").write_bytes(b"bravo bravo")
+        backend = FakeBackend()
+        upload_folder(source, "pkg", 1, backend, self.root / "ledger.json",
+                      version="1", issue="MGH-0")
+        self.manifest = self.root / "MANIFEST.json"
+        self.manifest.write_bytes(backend.objects["pkg/MANIFEST.json"][0])
+        self.download = self.root / "download"
+        shutil.copytree(str(source), str(self.download))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_matching_folder_passes_and_ignores_generated_listings(self):
+        shutil.copy(str(self.manifest), str(self.download / "MANIFEST.json"))
+        (self.download / "INDEX.md").write_text("index", encoding="utf-8")
+        result = verify_folder(self.download, self.manifest)
+        self.assertEqual(result, {"checked": 2, "ok": 2, "missing": [], "mismatch": [], "extra": []})
+
+    def test_missing_mismatch_and_extra_are_reported(self):
+        (self.download / "a.txt").unlink()
+        (self.download / "sub" / "b.bin").write_bytes(b"bravo bravo!")      # size differs
+        (self.download / "sub" / "c.bin").write_bytes(b"unlisted")
+        result = verify_folder(self.download, self.manifest)
+        self.assertEqual((result["missing"], result["mismatch"], result["extra"]),
+                         (["a.txt"], ["sub/b.bin"], ["sub/c.bin"]))
+        self.assertEqual(result["ok"], 0)
+
+    def test_same_size_but_different_content_is_a_mismatch(self):
+        (self.download / "a.txt").write_bytes(b"ALPHA")
+        self.assertEqual(verify_folder(self.download, self.manifest)["mismatch"], ["a.txt"])
+
+    def test_cli_exit_status_and_counts(self):
+        def run(*argv):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli.main(list(argv))
+            return code, out.getvalue(), err.getvalue()
+
+        code, out, _ = run("verify", str(self.download), str(self.manifest))
+        self.assertEqual(code, 0)
+        self.assertIn("Checked 2 files: 2 ok, 0 missing, 0 mismatch, 0 extra", out)
+        (self.download / "a.txt").unlink()
+        (self.download / "x.txt").write_text("x", encoding="utf-8")
+        (self.download / "sub" / "b.bin").write_bytes(b"other")
+        code, out, _ = run("verify", str(self.download), str(self.manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("MISSING a.txt", out)
+        self.assertIn("MISMATCH sub/b.bin", out)
+        self.assertIn("EXTRA x.txt", out)
+        self.assertIn("1 missing, 1 mismatch, 1 extra", out)
+        self.assertIn("FAILED", out)
+
+    def test_bad_manifests_are_rejected(self):
+        for payload in ('not json', '[]', '{"schema": "other/1", "files": []}',
+                        json.dumps({"schema": "review-kit-manifest/1",
+                                    "files": [{"relative_path": "../x", "bytes": 1, "sha256": "0"}]}),
+                        json.dumps({"schema": "review-kit-manifest/1",
+                                    "files": [{"relative_path": "a", "bytes": 1, "sha256": "0"}] * 2})):
+            self.manifest.write_text(payload, encoding="utf-8")
+            with self.assertRaises(ValueError, msg=payload):
+                verify_folder(self.download, self.manifest)
+
+    def test_upload_cli_passes_version_and_issue(self):
+        captured = {}
+
+        def fake_upload(*args, **kwargs):
+            captured.update(kwargs)
+            return {"index_url": "https://storage.example.test/index"}
+
+        with mock.patch.object(cli, "load_config", return_value={"_LEDGER_PATH": "ledger.json"}), \
+                mock.patch.object(cli, "create_backend", return_value=FakeBackend()), \
+                mock.patch.object(cli, "upload_folder", side_effect=fake_upload), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["share", "upload", str(self.download), "pkg",
+                                       "--issue", "MGH-0", "--version", "4"]), 0)
+            self.assertEqual((captured["version"], captured["issue"]), ("4", "MGH-0"))
+            self.assertEqual(cli.main(["share", "upload", str(self.download), "pkg"]), 0)
+            self.assertEqual((captured["version"], captured["issue"]), ("1", None))
 
 
 class SigV4Tests(unittest.TestCase):
