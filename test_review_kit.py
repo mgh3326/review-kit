@@ -1,12 +1,19 @@
 """Network-free tests for sharing, cleanup, path safety and AWS SigV4."""
+import contextlib
 import datetime as dt
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
-from review_kit.backends import _supabase_object_missing, sigv4_presigned_url, sigv4_signature
+from review_kit import cli
+from review_kit.backends import (S3Backend, _supabase_object_missing, create_backend,
+                                 sigv4_presigned_url, sigv4_signature)
+from review_kit.config import load_config
 from review_kit.package import assemble_package
 from review_kit.share import (done_package, load_ledger, prune_packages, resign_package,
                               safe_key, save_ledger, upload_folder)
@@ -273,6 +280,144 @@ class BackendResponseTests(unittest.TestCase):
         self.assertTrue(_supabase_object_missing(404, b""))
         self.assertFalse(_supabase_object_missing(400, b'{"message":"Invalid bucket"}'))
         self.assertFalse(_supabase_object_missing(401, b'{"message":"Object not found"}'))
+
+
+class S3EnvFileTests(unittest.TestCase):
+    """S3_ENV_FILE imports an existing KEY=VALUE secret file, mapping R2_* names."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.env_patcher = mock.patch.dict(os.environ)
+        self.env_patcher.start()
+        for name in ("BACKEND", "SUPABASE_URL", "SUPABASE_SERVICE_KEY",
+                     "SUPABASE_SECRET_KEY", "SUPABASE_BUCKET", "S3_ENDPOINT",
+                     "S3_REGION", "S3_BUCKET", "S3_ACCESS_KEY_ID",
+                     "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN",
+                     "S3_ADDRESSING_STYLE", "LEDGER_PATH", "SUPABASE_ENV_FILE",
+                     "S3_ENV_FILE", "PRUNE_HIGH_WATER_MB", "PRUNE_LOW_WATER_MB",
+                     "REVIEW_KIT_CONFIG_DIR", "REVIEW_KIT_PROFILE"):
+            os.environ.pop(name, None)
+
+    def tearDown(self):
+        self.env_patcher.stop()
+        self.temp.cleanup()
+
+    def _write(self, name, text):
+        path = self.root / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def _profile(self, body):
+        return self._write("dots.env", "BACKEND=s3\n" + body)
+
+    def test_r2_names_map_to_s3_settings(self):
+        secrets = self._write("r2.env",
+                              "R2_ACCOUNT_ID=acct123\n"
+                              "R2_ACCESS_KEY_ID=r2-access\n"
+                              "R2_SECRET_ACCESS_KEY=r2-secret\n"
+                              "R2_BUCKET=r2-bucket\n"
+                              "R2_ENDPOINT=https://acct123.r2.cloudflarestorage.com\n")
+        profile = self._profile("S3_ENV_FILE=%s\n" % secrets)
+        values = load_config(config_path=str(profile))
+        self.assertEqual(values["S3_ACCESS_KEY_ID"], "r2-access")
+        self.assertEqual(values["S3_SECRET_ACCESS_KEY"], "r2-secret")
+        self.assertEqual(values["S3_BUCKET"], "r2-bucket")
+        self.assertEqual(values["S3_ENDPOINT"],
+                         "https://acct123.r2.cloudflarestorage.com")
+        self.assertEqual(values["S3_REGION"], "auto")
+        self.assertEqual(values["S3_ADDRESSING_STYLE"], "path")
+        backend = create_backend(values)
+        self.assertIsInstance(backend, S3Backend)
+        self.assertEqual(backend.region, "auto")
+
+    def test_s3_names_import_as_is(self):
+        secrets = self._write("s3.env",
+                              "S3_ENDPOINT=https://s3.example.test\n"
+                              "S3_REGION=eu-test-1\n"
+                              "S3_BUCKET=generic-bucket\n"
+                              "S3_ACCESS_KEY_ID=s3-access\n"
+                              "S3_SECRET_ACCESS_KEY=s3-secret\n")
+        values = load_config(config_path=str(self._profile("S3_ENV_FILE=%s\n" % secrets)))
+        self.assertEqual(values["S3_ENDPOINT"], "https://s3.example.test")
+        self.assertEqual(values["S3_REGION"], "eu-test-1")
+        self.assertEqual(values["S3_BUCKET"], "generic-bucket")
+        # Without R2_* keys no R2 defaults are invented.
+        self.assertNotIn("S3_ADDRESSING_STYLE", values)
+
+    def test_template_endpoint_derives_from_account_id(self):
+        for endpoint_line in ("R2_ENDPOINT=https://<account_id>.r2.cloudflarestorage.com\n",
+                              ""):
+            secrets = self._write("r2.env",
+                                  "R2_ACCOUNT_ID=acct123\n" + endpoint_line +
+                                  "R2_ACCESS_KEY_ID=r2-access\n"
+                                  "R2_SECRET_ACCESS_KEY=r2-secret\n"
+                                  "R2_BUCKET=r2-bucket\n")
+            values = load_config(config_path=str(self._profile("S3_ENV_FILE=%s\n" % secrets)))
+            self.assertEqual(values["S3_ENDPOINT"],
+                             "https://acct123.r2.cloudflarestorage.com")
+
+    def test_included_file_sits_below_profile_and_process_env(self):
+        secrets = self._write("r2.env",
+                              "R2_ACCOUNT_ID=acct123\n"
+                              "R2_ACCESS_KEY_ID=file-access\n"
+                              "R2_SECRET_ACCESS_KEY=file-secret\n"
+                              "R2_BUCKET=file-bucket\n")
+        profile = self._profile("S3_ENV_FILE=%s\nS3_BUCKET=profile-bucket\n" % secrets)
+        values = load_config(config_path=str(profile))
+        self.assertEqual(values["S3_BUCKET"], "profile-bucket")
+        self.assertEqual(values["S3_ACCESS_KEY_ID"], "file-access")
+        os.environ["S3_BUCKET"] = "env-bucket"
+        os.environ["S3_ACCESS_KEY_ID"] = "env-access"
+        values = load_config(config_path=str(profile))
+        self.assertEqual(values["S3_BUCKET"], "env-bucket")
+        self.assertEqual(values["S3_ACCESS_KEY_ID"], "env-access")
+
+    def test_s3_env_file_may_come_from_process_env(self):
+        secrets = self._write("r2.env",
+                              "R2_ACCOUNT_ID=acct123\n"
+                              "R2_ACCESS_KEY_ID=r2-access\n"
+                              "R2_SECRET_ACCESS_KEY=r2-secret\n"
+                              "R2_BUCKET=r2-bucket\n")
+        os.environ["S3_ENV_FILE"] = str(secrets)
+        values = load_config(config_path=str(self._profile("")))
+        self.assertEqual(values["S3_BUCKET"], "r2-bucket")
+        self.assertEqual(values["S3_ACCESS_KEY_ID"], "r2-access")
+
+    def test_missing_env_file_names_the_key_not_the_path(self):
+        profile = self._profile("S3_ENV_FILE=%s\n" % (self.root / "absent.env"))
+        with self.assertRaises(ValueError) as caught:
+            load_config(config_path=str(profile))
+        self.assertIn("S3_ENV_FILE", str(caught.exception))
+        self.assertNotIn("absent.env", str(caught.exception))
+
+    def test_secret_values_never_appear_in_errors_or_status(self):
+        secrets = self._write("r2.env",
+                              "R2_ACCOUNT_ID=acct123\n"
+                              "R2_ACCESS_KEY_ID=live-access-xyz\n"
+                              "R2_SECRET_ACCESS_KEY=live-secret-xyz\n"
+                              "R2_BUCKET=r2-bucket\n")
+        profile = self._profile("S3_ENV_FILE=%s\n" % secrets)
+        leaked = ("live-access-xyz", "live-secret-xyz")
+
+        bad = self._write("bad.env",
+                          "BACKEND=s3\nS3_ENV_FILE=%s\nS3_BUCKET=\n" % secrets)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = cli.main(["--config", str(bad), "status"])
+        self.assertEqual(rc, 1)
+        self.assertIn("S3_BUCKET", err.getvalue())
+        for secret in leaked:
+            self.assertNotIn(secret, err.getvalue())
+
+        with mock.patch.object(cli, "create_backend", return_value=FakeBackend()):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cli.main(["--config", str(profile), "status"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Storage:", out.getvalue())
+        for secret in leaked + ("acct123",):
+            self.assertNotIn(secret, out.getvalue())
 
 
 class PackageTests(unittest.TestCase):

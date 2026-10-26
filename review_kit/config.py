@@ -6,6 +6,12 @@ import re
 
 KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+R2_S3_KEYS = {
+    "R2_ACCESS_KEY_ID": "S3_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY": "S3_SECRET_ACCESS_KEY",
+    "R2_BUCKET": "S3_BUCKET",
+}
+
 
 def read_env_file(path):
     values = {}
@@ -41,9 +47,38 @@ def _process_overrides():
         "SUPABASE_BUCKET", "S3_ENDPOINT", "S3_REGION", "S3_BUCKET",
         "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN",
         "S3_ADDRESSING_STYLE", "LEDGER_PATH", "SUPABASE_ENV_FILE",
-        "PRUNE_HIGH_WATER_MB", "PRUNE_LOW_WATER_MB",
+        "S3_ENV_FILE", "PRUNE_HIGH_WATER_MB", "PRUNE_LOW_WATER_MB",
     )
     return {name: os.environ[name] for name in names if name in os.environ}
+
+
+def _s3_env_file_values(path):
+    """Import an existing KEY=VALUE file, mapping Cloudflare R2_* names to S3_*."""
+    try:
+        raw = read_env_file(path)
+    except ValueError:
+        raise ValueError("S3_ENV_FILE could not be read")
+    values = {name: value for name, value in raw.items()
+              if name.startswith("S3_") and name != "S3_ENV_FILE"}
+    for source, target in R2_S3_KEYS.items():
+        if raw.get(source) and not values.get(target):
+            values[target] = raw[source]
+    if not values.get("S3_ENDPOINT"):
+        endpoint = raw.get("R2_ENDPOINT", "")
+        if "<" in endpoint or ">" in endpoint:
+            endpoint = ""  # the endpoint is still a template
+        elif endpoint and "://" not in endpoint:
+            endpoint = "https://" + endpoint
+        if not endpoint and raw.get("R2_ACCOUNT_ID"):
+            candidate = "https://%s.r2.cloudflarestorage.com" % raw["R2_ACCOUNT_ID"]
+            if "<" not in candidate and ">" not in candidate:
+                endpoint = candidate
+        if endpoint:
+            values["S3_ENDPOINT"] = endpoint
+    if any(name.startswith("R2_") for name in raw):
+        values.setdefault("S3_REGION", "auto")
+        values.setdefault("S3_ADDRESSING_STYLE", "path")
+    return values
 
 
 def load_config(profile="default", config_path=None):
@@ -69,6 +104,11 @@ def load_config(profile="default", config_path=None):
         profile_values = read_env_file(profile_path) if profile_path.is_file() else {}
         process_values = _process_overrides()
         values = {**included_values, **profile_values, **process_values}
+    included = values.get("S3_ENV_FILE")
+    if included:
+        included_values = _s3_env_file_values(included)
+        # Explicit profile and process values override values from the included file.
+        values = {**included_values, **values}
     values["_PROFILE"] = profile
     values["_PROFILE_PATH"] = str(profile_path)
     default_ledger = profile_path.with_name(profile_path.stem + ".ledger.json")
