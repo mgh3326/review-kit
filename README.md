@@ -123,7 +123,7 @@ Example manifest shape:
 }
 ```
 
-`INDEX.md` lists each relative file, byte size, local SHA256, source (`drive` or `storage`), and link. It includes the expiry date and optional Drive folder link. The command prints a signed link to INDEX. Anyone who holds a signed link can read that file until the link expires; share the printed INDEX link only with the intended reviewer. Signed links expire after 1–7 days, but the stored objects do **not** expire or delete automatically.
+`INDEX.md` (and the machine-readable `MANIFEST.json`, below) lists each relative file, byte size, local SHA256, source (`drive` or `storage`), and link. It includes the expiry date and optional Drive folder link. The command prints a signed link to INDEX. Anyone who holds a signed link can read that file until the link expires; share the printed INDEX link only with the intended reviewer. Signed links expire after 1–7 days, but the stored objects do **not** expire or delete automatically.
 
 ```bash
 review-kit status                 # storage use and tracked packages
@@ -139,6 +139,29 @@ review-kit done pa-review-123     # delete this package after review
 Expiry applies to links; it does not delete stored files. Retention is based on bucket capacity. `prune` does nothing at or below the high-water mark; above it, it removes the oldest tracked packages until usage reaches the low-water mark. Defaults are **900 MB high / 700 MB low** (decimal MB) for a 1 GB bucket. Set `PRUNE_HIGH_WATER_MB` and `PRUNE_LOW_WATER_MB` in the profile, or override them on the `prune` command. `share upload` runs this capacity check before uploading.
 
 The ledger is JSON beside the selected profile by default (`<profile>.ledger.json`); set `LEDGER_PATH` to move it. Ledger writes are atomic. It records the exact storage objects and file hashes; `done` and `prune` only delete objects in those records, never Drive files or untracked bucket content. `status` warns above 800 MB. When a kept package's links expire, `resign` checks each stored object's SHA256 metadata against the ledger, signs fresh GET links, updates INDEX.md, and updates the expiry date without uploading unchanged package files. It preserves the original upload date used for oldest-first retention.
+
+### MANIFEST.json and verify
+
+`share upload` also writes and uploads `MANIFEST.json` next to `INDEX.md`, and `resign` refreshes it with the new links and expiry. INDEX.md links to it. It is the machine-readable twin of INDEX.md:
+
+```json
+{"schema": "review-kit-manifest/1", "package_id": "pa-review-123", "version": "1",
+ "issue_id": "<ISSUE_ID or null>", "created_utc": "...", "expires_utc": "...",
+ "files": [{"relative_path": "stills/screen-01.png", "bytes": 0, "sha256": "...",
+            "source": "storage", "url": "<SIGNED_OR_DRIVE_LINK>"}]}
+```
+
+`--version` (default `1`) and `--issue` (default `null`) are free-form single-line strings: `review-kit share upload ./review-package pa-review-123 --issue <ISSUE_ID> --version 2`. `INDEX.md` and `MANIFEST.json` are generated, so the input folder may not contain files with those names, and neither lists itself.
+
+**The manifest is private material, like INDEX.md.** It carries the same signed links, so anyone who holds it can read the listed files until the links expire.
+
+After downloading the files into a folder, the reviewer checks them with:
+
+```bash
+review-kit verify ./downloaded-package ./MANIFEST.json
+```
+
+It compares the size and SHA256 of every listed file, prints `MISSING`, `MISMATCH` and `EXTRA` lines plus their counts, and exits non-zero on any problem. `INDEX.md` and `MANIFEST.json` in the folder are not counted as extra. It needs no profile or network.
 
 Upload refuses to overwrite any existing storage key unless its recorded SHA256 matches. Use a fresh prefix for each package; run `done` to remove an active package before reusing its prefix.
 
@@ -214,7 +237,7 @@ PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py && python
 
 On Windows or a different environment, choose a writable cache path or omit the environment assignment. Tests create tiny synthetic inputs and preserve results under `test_artifacts/`. Successful paths use real FFmpeg/ffprobe. Certain oversize, timeout, missing-tool, and validation-failure cases use explicit mocks. Tests cover audio/no audio, delayed/short audio, delayed-video rejection, odd dimensions, portrait, rotation 90, full/limited/unspecified color range (black/white pixel levels checked within ±3), a reproduction of the pre-fix full-range failure, HDR rejection, conflicting color tags, missing FFmpeg filters, one-frame clips, decimal/binary caps, strict size-cap and duration boundaries, silent inputs recorded as audio absent, Korean/space paths, collisions, bounded retries/floors, interruption without DONE, corrupted media, and final-metadata failure without DONE.
 
-`test_review_kit.py` uses a fake backend and no network. It covers mixed Drive/storage INDEX rows, Drive-only packages, ledger cleanup, capacity-based oldest-first pruning, re-signing without package re-upload, safe object keys, and AWS-published SigV4 signatures.
+`test_review_kit.py` uses a fake backend and no network. It covers mixed Drive/storage INDEX rows, Drive-only packages, ledger cleanup, capacity-based oldest-first pruning, re-signing without package re-upload, `MANIFEST.json` content and refresh, `verify` OK/missing/mismatch/extra, safe object keys, and AWS-published SigV4 signatures.
 
 ## License
 

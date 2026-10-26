@@ -115,6 +115,29 @@ review-kit done pa-review-123           # 검수 종료 후 명시적으로 삭�
 
 `status`는 800 MB를 넘으면 경고를 표시합니다.
 
+### MANIFEST.json과 verify
+
+`share upload`는 `INDEX.md` 옆에 `MANIFEST.json`도 만들어 업로드하며, `resign`은 새 링크와 만료일로 이를 갱신합니다. INDEX.md 상단에 링크가 있습니다. INDEX.md의 기계 판독용 짝입니다.
+
+```json
+{"schema": "review-kit-manifest/1", "package_id": "pa-review-123", "version": "1",
+ "issue_id": "<ISSUE_ID 또는 null>", "created_utc": "...", "expires_utc": "...",
+ "files": [{"relative_path": "stills/screen-01.png", "bytes": 0, "sha256": "...",
+            "source": "storage", "url": "<서명 링크 또는 Drive 링크>"}]}
+```
+
+`--version`(기본 `1`)과 `--issue`(기본 `null`)는 한 줄짜리 자유 문자열입니다. 예: `review-kit share upload ./review-package pa-review-123 --issue <ISSUE_ID> --version 2`. `INDEX.md`와 `MANIFEST.json`은 자동 생성되므로 입력 폴더에 같은 이름의 파일이 있으면 안 되고, 두 파일은 목록에 들어가지 않습니다.
+
+**매니페스트는 INDEX.md와 같은 비공개 자료입니다.** 같은 서명 링크가 들어 있으므로, 가진 사람은 링크가 만료될 때까지 목록의 파일을 읽을 수 있습니다.
+
+검수자는 파일을 폴더에 내려받은 뒤 다음으로 확인합니다.
+
+```bash
+review-kit verify ./downloaded-package ./MANIFEST.json
+```
+
+목록의 모든 파일의 크기와 SHA256을 비교하고, `MISSING`·`MISMATCH`·`EXTRA` 줄과 개수를 출력하며, 문제가 하나라도 있으면 0이 아닌 코드로 종료합니다. 폴더 안의 `INDEX.md`와 `MANIFEST.json`은 extra로 세지 않습니다. 프로필이나 네트워크가 필요 없습니다.
+
 ## 빠른 시작
 
 ```bash
