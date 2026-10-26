@@ -31,7 +31,7 @@ review-kit package ./review-package \
 
 ### 프로필과 저장소 설정
 
-프로필은 `~/.config/review-kit/<프로필>.env`의 `KEY=VALUE` 형식 파일입니다. `review-kit --profile <프로필> ...` 또는 `REVIEW_KIT_PROFILE`로 선택합니다. 환경 변수로 값과 자격 증명을 지정할 수도 있습니다. `SUPABASE_ENV_FILE`은 기존 별도 env 파일을 읽으며 셸 명령을 실행하지 않습니다.
+프로필은 `~/.config/review-kit/<프로필>.env`의 `KEY=VALUE` 형식 파일입니다. `review-kit --profile <프로필> ...` 또는 `REVIEW_KIT_PROFILE`로 선택합니다. 환경 변수로 값과 자격 증명을 지정할 수도 있습니다. `SUPABASE_ENV_FILE`과 `S3_ENV_FILE`은 기존 별도 env 파일을 읽으며 셸 명령을 실행하지 않습니다. 우선순위는 가져온 파일 < 프로필 < 프로세스 환경 변수입니다.
 
 Supabase 프로필 예시(자리표시자):
 
@@ -56,6 +56,15 @@ S3_ADDRESSING_STYLE=path
 ```
 
 `S3_ENDPOINT`는 서비스 엔드포인트, `S3_REGION`은 SigV4 리전입니다. 주소 방식은 `path` 또는 `virtual`이며 기본값은 `path`입니다.
+
+기존 시크릿 파일을 쓰는 Cloudflare R2 예시:
+
+```ini
+BACKEND=s3
+S3_ENV_FILE=/path/to/existing/r2-credentials.env
+```
+
+참조 파일에는 일반 `S3_*` 이름 또는 Cloudflare의 `R2_*` 이름(`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT`)을 둘 수 있습니다. `R2_*` 이름은 대응하는 `S3_*` 설정으로 변환되며, `R2_ENDPOINT`가 없거나 `https://<account_id>.r2.cloudflarestorage.com` 같은 템플릿이면 `R2_ACCOUNT_ID`로 엔드포인트를 만듭니다. R2를 가져올 때는 `S3_REGION=auto`와 path 주소 방식이 기본값입니다.
 
 | 제공자 | 엔드포인트·리전 설정 | 주소 방식 |
 |---|---|---|

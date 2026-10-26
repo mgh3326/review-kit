@@ -58,7 +58,7 @@ The package contains `README_review_request.md`, a `videos/` directory with the 
 
 ### Configure a profile
 
-Profiles are plain `KEY=VALUE` files at `~/.config/review-kit/<profile>.env`. Select one with `review-kit --profile <profile> ...` or `REVIEW_KIT_PROFILE`. Credentials can be supplied in environment variables. The optional `SUPABASE_ENV_FILE` setting imports a separate existing env file; no shell is evaluated.
+Profiles are plain `KEY=VALUE` files at `~/.config/review-kit/<profile>.env`. Select one with `review-kit --profile <profile> ...` or `REVIEW_KIT_PROFILE`. Credentials can be supplied in environment variables. The optional `SUPABASE_ENV_FILE` and `S3_ENV_FILE` settings import a separate existing env file; no shell is evaluated. Values from the imported file sit below the profile, which sits below process environment variables.
 
 Supabase profile (placeholders only):
 
@@ -83,6 +83,15 @@ S3_ADDRESSING_STYLE=path
 ```
 
 `S3_ENDPOINT` is the service endpoint, and `S3_REGION` is its SigV4 region. `S3_ADDRESSING_STYLE` accepts `path` or `virtual`; the default is `path`.
+
+Cloudflare R2 with an existing secret file:
+
+```ini
+BACKEND=s3
+S3_ENV_FILE=/path/to/existing/r2-credentials.env
+```
+
+The referenced file may use the usual `S3_*` names or Cloudflare's `R2_*` names (`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT`). `R2_*` names map onto the matching `S3_*` settings; when `R2_ENDPOINT` is missing or still a template such as `https://<account_id>.r2.cloudflarestorage.com`, the endpoint is derived from `R2_ACCOUNT_ID`. R2 imports default to `S3_REGION=auto` and path-style addressing.
 
 | Provider | Endpoint and region settings | Addressing |
 |---|---|---|
