@@ -6,9 +6,12 @@ from pathlib import Path
 import sys
 
 from .backends import create_backend
+from .board import (board_comments, comments_markdown, inventory_board,
+                    inventory_markdown, place_board)
 from .config import load_config
 from .deliver import (cleanup_package, deliver_package, deliveries_path,
                       drive_visible, load_deliveries)
+from .miro import MiroClient
 from .share import (DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES, done_package,
                     package_status, prune_packages, resign_package, upload_folder)
 from .verify import verify_folder
@@ -97,6 +100,27 @@ def _parser():
         "deliveries", help="list deliveries still waiting for cleanup")
     deliveries.add_argument("--all", action="store_true",
                             help="include deliveries already cleaned up")
+
+    board = commands.add_parser(
+        "board", help="lay out review captures on a Miro board")
+    board_commands = board.add_subparsers(dest="board_command", required=True)
+    place = board_commands.add_parser("place",
+                                      help="create or update the frame, captures and links")
+    place.add_argument("board_id")
+    place.add_argument("list", type=Path, metavar="list.json")
+    place.add_argument("--prune", action="store_true",
+                       help="delete widgets whose keys were removed from the list")
+    place.add_argument("--dry-run", action="store_true")
+    inventory = board_commands.add_parser("inventory",
+                                          help="markdown table of board widgets and links")
+    inventory.add_argument("board_id")
+    inventory.add_argument("--frame", help="only items inside this frame id")
+    inventory.add_argument("--json", action="store_true")
+    comments = board_commands.add_parser("comments",
+                                         help="read board comments with their widgets")
+    comments.add_argument("board_id")
+    comments.add_argument("--since", help="ISO-8601 timestamp; only newer comments")
+    comments.add_argument("--json", action="store_true")
 
     package = commands.add_parser("package", help="assemble videos, stills and a review request")
     package.add_argument("output", type=Path)
@@ -212,6 +236,44 @@ def _run_delivery_command(args):
     return 0
 
 
+def _board_place(client, config, args):
+    result = place_board(client, args.board_id, args.list, config,
+                         prune=args.prune, dry_run=args.dry_run)
+    for line in result["plan"]:
+        print(line)
+    if result["dry_run"]:
+        print("Dry run; nothing was created or changed.")
+
+
+def _board_inventory(client, config, args):
+    rows, items = inventory_board(client, args.board_id, frame_id=args.frame)
+    if args.json:
+        print(json.dumps({"rows": rows, "items": items},
+                         ensure_ascii=False, indent=2))
+    else:
+        print(inventory_markdown(rows))
+
+
+def _board_comments(client, config, args):
+    rows = board_comments(client, args.board_id, since=args.since)
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+    else:
+        print(comments_markdown(rows) or "No comments")
+
+
+def _run_board_command(args):
+    config = load_config(args.profile, args.config)
+    client = MiroClient(config)
+    handlers = {"place": _board_place, "inventory": _board_inventory,
+                "comments": _board_comments}
+    handler = handlers.get(args.board_command)
+    if handler is None:
+        raise ValueError("unsupported command")
+    handler(client, config, args)
+    return 0
+
+
 def _run_verify(args):
     result = verify_folder(args.directory, args.manifest)
     for label, names in (("MISSING", result["missing"]), ("MISMATCH", result["mismatch"]),
@@ -237,6 +299,8 @@ def main(argv=None):
             return _run_verify(args)
         if args.command in ("deliver", "drive-visible", "cleanup", "deliveries"):
             return _run_delivery_command(args)
+        if args.command == "board":
+            return _run_board_command(args)
         config, backend, ledger_path = _backend_and_ledger(args)
         if args.command == "share" and args.share_command == "upload":
             manifest = _load_drive_manifest(args.drive_manifest)

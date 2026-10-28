@@ -180,6 +180,56 @@ review-kit --profile work cleanup pa-review-123 --drive-confirmed   # 직접 확
 
 `cleanup`은 검사 결과가 `no`나 `unknown`이면 `--drive-confirmed` 없이는 실행을 거부합니다. Dropbox 삭제는 보호되어 있습니다. `DROPBOX_REMOTE` 아래의 기록된 리모트 경로만 `rclone purge`로 지우고, 스토리지에서는 원장에 추적된 객체만(`done` 규칙) 삭제합니다. 모든 전달은 `~/.local/state/review-kit/deliveries.json`에 기록되며(`DELIVERIES_PATH`로 이동 가능), `review-kit deliveries`가 아직 정리를 기다리는 전달을 보여주고 `--all`은 전부를 보여줍니다.
 
+### board: Miro 와이어플로 배치
+
+`review-kit board`는 캡처(Canva 내보내기, 게임 촬영, 참고 이미지)를 하나의 선언적 목록 파일로 Miro 보드에 배치하는 명령입니다. 임시 스크립트로 하던 작업의 재사용 가능한 형태이며 Miro REST API와 Python 표준 라이브러리만 사용합니다.
+
+```ini
+# 프로필 추가 설정
+MIRO_ACCESS_TOKEN=<TOKEN>
+# 또는 토큰을 별도 env 파일에 보관:
+MIRO_ENV_FILE=/path/to/miro-credentials.env
+```
+
+토큰은 출력이나 로그에 남기지 않습니다. 레이트 리밋(HTTP 429)과 서버 오류는 `Retry-After`/지수 백오프로 재시도합니다.
+
+```bash
+review-kit --profile work board place <BOARD_ID> ./wireflow.json
+review-kit --profile work board place <BOARD_ID> ./wireflow.json --dry-run
+review-kit --profile work board place <BOARD_ID> ./wireflow.json --prune
+review-kit --profile work board inventory <BOARD_ID> [--frame <FRAME_ID>] [--json]
+review-kit --profile work board comments <BOARD_ID> [--since 2026-10-25T00:00:00Z] [--json]
+```
+
+목록 JSON 형식:
+
+```json
+{
+  "frame": {"title": "Wireflow v1", "position": "auto:right"},
+  "columns": 3,
+  "cell": {"width": 320, "padding": 24, "header": 48},
+  "items": [
+    {"key": "home", "image": "./shots/home.png", "caption": "Home",
+     "source": "canva", "group": "core"},
+    {"key": "game", "image": "https://example.test/game.png",
+     "caption": "Game", "aspect": 1.78, "group": "core"},
+    {"key": "ref-1", "image": "./refs/ref.png", "caption": "Reference",
+     "source": "reference", "group": "refs"}
+  ],
+  "links": [{"from": "home", "to": "game", "label": "tap"}],
+  "text_updates": {"<WIDGET_ID>": "replacement content"}
+}
+```
+
+- `frame.position`: `{"x": N, "y": N}`, `"auto:right"`(가장 오른쪽 프레임의 오른쪽), `"auto:below"`(가장 아래 프레임의 아래). 기존 프레임 경계를 먼저 읽어 새 프레임이 겹치지 않습니다.
+- `items[].image`: 로컬 파일(PNG/JPEG/GIF/BMP/WebP — 크기를 읽어 그리드에 반영) 또는 `https://` URL(Canva 내보내기 URL 가능, 원격 크기를 알 수 없으므로 `aspect`나 `width`/`height` 지정, 기본 4:3).
+- `group`은 굵은 헤더 행 아래로 항목을 묶고, `source`는 `inventory`에 표시되는 자유 태그입니다.
+- 캡션은 각 이미지 아래에 표시되는 Miro 이미지 제목입니다. 생성된 위젯에는 키와 출처를 기록하는 숨은 `rk:` 태그(이미지 description / HTML 주석)도 들어갑니다.
+
+**멱등 동작.** `place`는 각 키 → 위젯 id를 `~/.local/state/review-kit/board-<BOARD_ID>.json`에 기록하고 위젯에도 키를 심습니다. 재실행하면 복제 대신 위치·캡션·텍스트를 그대로 갱신하고, Miro에서 지워진 위젯은 다시 만듭니다(PATCH → 404 → POST). 목록에서 항목을 빼도 위젯은 남지만 `--prune`이면 빠진 키의 위젯과 커넥터를 삭제합니다.
+
+`inventory`는 마크다운 표(키 / 위젯 id / 타입 / 캡션 / 나가는 링크 / 들어오는 링크 / 출처)를 출력해 검수자가 API 쿼터를 쓰지 않고 보드를 파악하게 합니다. `comments`는 각 댓글이 달린 위젯 키와 함께 보드 댓글을 읽어 변경 요청을 모읍니다. `--since`는 시간 필터, 두 명령 모두 `--json`으로 원시 행을 출력합니다.
+
 ## 빠른 시작
 
 ```bash
