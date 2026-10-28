@@ -12,8 +12,7 @@ DEFAULT_RETRIES = 4
 MAX_RETRY_DELAY = 60.0
 ITEM_PAGE = "/v2/boards/%s/items"
 ITEM_URL = "/v2/boards/%s/items/%s"
-COMMENTS_PAGE = "/v2/boards/%s/comments"
-ITEM_COMMENTS_PAGE = "/v2/boards/%s/items/%s/comments"
+CONNECTORS_PAGE = "/v2/boards/%s/connectors"
 
 
 class MiroError(RuntimeError):
@@ -141,14 +140,6 @@ class MiroClient:
     def delete_item(self, board_id, item_id):
         return self.delete(ITEM_URL % (board_id, item_id))
 
-    def comments(self, board_id):
-        """Board-level comments, falling back to per-item comments on older APIs."""
-        try:
-            return self.list_all(COMMENTS_PAGE % board_id)
-        except MiroError as exc:
-            if exc.status != 404:
-                raise
-        found = []
-        for item in self.items(board_id):
-            found.extend(self.list_all(ITEM_COMMENTS_PAGE % (board_id, item["id"])))
-        return found
+    def connectors(self, board_id):
+        """All connectors; they are board-level items, not frame children."""
+        return self.list_all(CONNECTORS_PAGE % board_id)

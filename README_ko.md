@@ -198,7 +198,7 @@ review-kit --profile work board place <BOARD_ID> ./wireflow.json
 review-kit --profile work board place <BOARD_ID> ./wireflow.json --dry-run
 review-kit --profile work board place <BOARD_ID> ./wireflow.json --prune
 review-kit --profile work board inventory <BOARD_ID> [--frame <FRAME_ID>] [--json]
-review-kit --profile work board comments <BOARD_ID> [--since 2026-10-25T00:00:00Z] [--json]
+review-kit --profile work board comments <BOARD_ID>
 ```
 
 목록 JSON 형식:
@@ -228,7 +228,9 @@ review-kit --profile work board comments <BOARD_ID> [--since 2026-10-25T00:00:00
 
 **멱등 동작.** `place`는 각 키 → 위젯 id를 `~/.local/state/review-kit/board-<BOARD_ID>.json`에 기록하고 위젯에도 키를 심습니다. 재실행하면 복제 대신 위치·캡션·텍스트를 그대로 갱신하고, Miro에서 지워진 위젯은 다시 만듭니다(PATCH → 404 → POST). 목록에서 항목을 빼도 위젯은 남지만 `--prune`이면 빠진 키의 위젯과 커넥터를 삭제합니다.
 
-`inventory`는 마크다운 표(키 / 위젯 id / 타입 / 캡션 / 나가는 링크 / 들어오는 링크 / 출처)를 출력해 검수자가 API 쿼터를 쓰지 않고 보드를 파악하게 합니다. `comments`는 각 댓글이 달린 위젯 키와 함께 보드 댓글을 읽어 변경 요청을 모읍니다. `--since`는 시간 필터, 두 명령 모두 `--json`으로 원시 행을 출력합니다.
+`inventory`는 마크다운 표(키 / 위젯 id / 타입 / 캡션 / 나가는 링크 / 들어오는 링크 / 출처)를 출력해 검수자가 API 쿼터를 쓰지 않고 보드를 파악하게 합니다. 커넥터는 보드 수준 `/connectors` 엔드포인트로 읽으므로 `--frame`을 써도 프레임 안 위젯과 연결된 링크를 볼 수 있습니다.
+
+`board comments`는 존재하지만 안내 메시지만 출력합니다. Miro REST API는 댓글을 제공하지 않습니다(REST 소개 문서의 Comment CRUD가 지원 안 됨). 검수자 댓글은 Miro MCP 댓글 도구(`comment_list_comments` 등)나 보드 UI로 모으세요. 종료 코드는 2입니다.
 
 ## 빠른 시작
 

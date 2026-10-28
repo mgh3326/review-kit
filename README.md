@@ -225,7 +225,7 @@ review-kit --profile work board place <BOARD_ID> ./wireflow.json
 review-kit --profile work board place <BOARD_ID> ./wireflow.json --dry-run
 review-kit --profile work board place <BOARD_ID> ./wireflow.json --prune
 review-kit --profile work board inventory <BOARD_ID> [--frame <FRAME_ID>] [--json]
-review-kit --profile work board comments <BOARD_ID> [--since 2026-10-25T00:00:00Z] [--json]
+review-kit --profile work board comments <BOARD_ID>
 ```
 
 List JSON shape:
@@ -255,7 +255,9 @@ List JSON shape:
 
 **Idempotent.** `place` records each key → widget id in `~/.local/state/review-kit/board-<BOARD_ID>.json` and embeds the key in the widget. Re-running updates positions, captions and text in place instead of duplicating; a widget deleted on Miro is recreated (PATCH → 404 → POST). Removing an item from the list leaves its widget alone unless `--prune`, which deletes dropped keys and their connectors.
 
-`inventory` prints a markdown table (key / widget id / type / caption / links out / links in / source) so the reviewer doesn't need to spend their own API quota listing the board. `comments` reads board comments with the widget key each is attached to, for collecting change requests; `--since` filters by time and `--json` prints raw rows for both commands.
+`inventory` prints a markdown table (key / widget id / type / caption / links out / links in / source) so the reviewer doesn't need to spend their own API quota listing the board. Connector links are resolved from the board-level `/connectors` endpoint, so `--frame` still sees links whose endpoints are inside the frame.
+
+`board comments` exists but only prints a pointer: comments are **not exposed by the Miro REST API** (the Miro REST introduction marks Comment CRUD unsupported). Collect reviewer comments with the Miro MCP comment tools (e.g. `comment_list_comments`) or in the board UI; the command exits with status 2.
 
 ## Usage
 
