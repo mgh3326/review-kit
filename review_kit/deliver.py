@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
-import subprocess
+import subprocess  # nosec B404 -- fixed ssh/rclone invocations only, never shell=True
 import tempfile
 
 from .backends import create_backend
@@ -53,18 +53,32 @@ def _remote_quote(path):
 
 def _default_run(argv, stdin=None, env=None):
     """Run a command and return stdout bytes; raise RuntimeError on failure."""
-    if isinstance(argv, str):
-        result = subprocess.run(argv, shell=True, input=stdin,
-                                capture_output=True, env=env)
-    else:
-        result = subprocess.run([str(arg) for arg in argv], input=stdin,
-                                capture_output=True, env=env)
+    result = subprocess.run([str(arg) for arg in argv], input=stdin,  # nosec B603
+                            capture_output=True, env=env)
     if result.returncode:
         stderr = result.stderr.decode("utf-8", "replace").strip()
         detail = ("; " + stderr[:200]) if stderr else ""
-        command = argv if isinstance(argv, str) else argv[0]
-        raise RuntimeError("%s failed (exit %d)%s" % (command, result.returncode, detail))
+        raise RuntimeError("%s failed (exit %d)%s" % (argv[0], result.returncode, detail))
     return result.stdout
+
+
+def _run_check_command(command, env, run):
+    """Run a user-supplied check hook through the platform shell."""
+    argv = ["cmd", "/c", command] if os.name == "nt" else ["sh", "-c", command]
+    return run(argv, env=env)
+
+
+def _package_file_entry(root_path, name, folder):
+    """(relative, path) for a regular package file, or None to skip it."""
+    path = root_path / name
+    if path.is_symlink():
+        raise ValueError("Symbolic-link files are not supported in delivery folders")
+    if not path.is_file():
+        return None
+    relative = path.relative_to(folder).as_posix()
+    if relative == DELIVERY_NAME:
+        return None
+    return relative, path
 
 
 def _walk_package_files(folder):
@@ -72,20 +86,15 @@ def _walk_package_files(folder):
     files = []
     for root, directories, names in os.walk(str(folder), followlinks=False):
         root_path = Path(root)
-        for directory in list(directories):
-            if (root_path / directory).is_symlink():
-                raise ValueError("Symbolic-link directories are not supported in delivery folders")
         directories.sort()
+        for directory in directories:
+            if (root_path / directory).is_symlink():
+                raise ValueError("Symbolic-link directories are not supported "
+                                 "in delivery folders")
         for name in sorted(names):
-            path = root_path / name
-            if path.is_symlink():
-                raise ValueError("Symbolic-link files are not supported in delivery folders")
-            if not path.is_file():
-                continue
-            relative = path.relative_to(folder).as_posix()
-            if relative == DELIVERY_NAME:
-                continue
-            files.append((relative, path))
+            entry = _package_file_entry(root_path, name, folder)
+            if entry:
+                files.append(entry)
     return files
 
 
@@ -95,6 +104,15 @@ def _local_manifest(files, name, now):
              "source": "local", "url": ""}
             for relative, path in files if relative not in GENERATED_ROOT_NAMES]
     return build_manifest(safe_key(name), "1", None, now, now, rows)
+
+
+def _resolve_manifest(directory, files, name, now):
+    """(manifest dict, manifest bytes, source) for the package."""
+    manifest_path = directory / MANIFEST_NAME
+    if manifest_path.is_file():
+        return load_manifest(manifest_path), manifest_path.read_bytes(), "existing"
+    data = _local_manifest(files, name, now)
+    return json.loads(data.decode("utf-8")), data, "generated"
 
 
 def _copy_drive_ssh(run, host, dest, files, manifest_data, manifest_source):
@@ -130,6 +148,34 @@ def _verify_drive_ssh(run, host, dest, manifest):
     if missing or mismatch or extra:
         raise RuntimeError("Drive copy verification failed: %d missing, %d mismatch, %d extra"
                            % (len(missing), len(mismatch), len(extra)))
+
+
+def _copy_and_verify_drive(run, mount, name, directory, files, manifest,
+                           manifest_data, manifest_source):
+    """Copy the package into DRIVE_MOUNT_DIR/<name>/ and verify it."""
+    ssh_target = _split_ssh_target(mount)
+    if ssh_target:
+        host, root = ssh_target
+        dest = root.rstrip("/") + "/" + name
+        _copy_drive_ssh(run, host, dest, files, manifest_data, manifest_source)
+        _verify_drive_ssh(run, host, dest, manifest)
+        return
+    dest = Path(mount).expanduser() / name
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(str(directory), str(dest), dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(DELIVERY_NAME))
+    if manifest_source == "generated":
+        (dest / MANIFEST_NAME).write_bytes(manifest_data)
+        verify_manifest = dest / MANIFEST_NAME
+    else:
+        verify_manifest = directory / MANIFEST_NAME
+    result = verify_folder(dest, verify_manifest)
+    problems = (len(result["missing"]) + len(result["mismatch"]) +
+                len(result["extra"]))
+    if problems:
+        raise RuntimeError(
+            "Drive copy verification failed: %d missing, %d mismatch, %d extra"
+            % (len(result["missing"]), len(result["mismatch"]), len(result["extra"])))
 
 
 def _within_remote(remote, dest):
@@ -221,10 +267,10 @@ def drive_visible(config, name, run=None):
     mount = (config.get("DRIVE_MOUNT_DIR") or "").strip().rstrip("/")
     env["REVIEW_KIT_DRIVE_PATH"] = (mount + "/" + name) if mount else ""
     try:
-        output = run(command, env=env).decode("utf-8", "replace").strip().lower()
+        output = _run_check_command(command, env, run).decode("utf-8", "replace")
+        first = output.splitlines()[0].strip().lower() if output.splitlines() else ""
     except (OSError, RuntimeError):
         return "unknown"
-    first = output.splitlines()[0].strip() if output else ""
     if first in ("yes", "y", "true", "1"):
         return "yes"
     if first in ("no", "n", "false", "0"):
@@ -280,16 +326,8 @@ def delivery_markdown(delivery):
     return "\n".join(lines)
 
 
-def deliver_package(config, directory, name, days=7, no_dropbox=False,
-                    force_supabase=False, dry_run=False, run=None,
-                    backend_factory=None, backend_name=None, now=None,
-                    state_path=None):
-    """Copy to the Drive mount, then Dropbox via rclone, then storage on failure."""
-    run = run or _default_run
-    name = validate_name(name)
-    directory = Path(directory).expanduser()
-    if not directory.is_dir():
-        raise ValueError("Delivery input must be an existing directory")
+def _deliver_options(config, no_dropbox, force_supabase):
+    """(mount, dropbox_remote, want_dropbox) after validating profile and flags."""
     if no_dropbox and force_supabase:
         raise ValueError("--no-dropbox and --force-supabase are mutually exclusive")
     mount = (config.get("DRIVE_MOUNT_DIR") or "").strip()
@@ -300,68 +338,74 @@ def deliver_package(config, directory, name, days=7, no_dropbox=False,
     if want_dropbox and not dropbox_remote:
         raise ValueError("Profile needs DROPBOX_REMOTE, "
                          "or pass --no-dropbox / --force-supabase")
+    return mount, dropbox_remote, want_dropbox
+
+
+def _deliver_plan(name, mount, files, manifest_source, want_dropbox,
+                  force_supabase, dropbox_remote):
+    plan = ["Plan for %s:" % name,
+            "  drive: copy %d file(s) -> %s%s" % (
+                len(files), mount.rstrip("/") + "/" + name,
+                " over ssh" if _split_ssh_target(mount) else "")]
+    if manifest_source == "generated":
+        plan.append("  drive: write generated %s and verify sha256" % MANIFEST_NAME)
+    else:
+        plan.append("  drive: verify sha256 against existing %s" % MANIFEST_NAME)
+    if want_dropbox:
+        plan.append("  dropbox: rclone copy/check/size/link -> %s"
+                    % dropbox_destination(dropbox_remote, name))
+        plan.append("  storage: upload to the configured backend only if Dropbox fails")
+    elif force_supabase:
+        plan.append("  storage: upload to the configured backend (forced)")
+    else:
+        plan.append("  dropbox/storage: skipped (--no-dropbox)")
+    plan.append("  record: write %s and update deliveries.json" % DELIVERY_NAME)
+    return plan
+
+
+def _record_delivery(config, delivery, directory, state_path):
+    """Write DELIVERY.json beside the package and update the deliveries state."""
+    delivery_path = Path(directory) / DELIVERY_NAME
+    delivery_path.write_text(json.dumps(delivery, ensure_ascii=False, indent=2,
+                                        sort_keys=True) + "\n", encoding="utf-8")
+    path = state_path or deliveries_path(config)
+    state = load_deliveries(path)
+    entry = dict(delivery)
+    entry.update({"drive_visible": "unknown", "cleaned": False,
+                  "cleaned_utc": None, "removed": []})
+    state["deliveries"][delivery["name"]] = entry
+    save_deliveries(path, state)
+    return delivery_path
+
+
+def deliver_package(config, directory, name, days=7, no_dropbox=False,
+                    force_supabase=False, dry_run=False, run=None,
+                    backend_factory=None, backend_name=None, now=None,
+                    state_path=None):
+    """Copy to the Drive mount, then Dropbox via rclone, then storage on failure."""
+    run = run or _default_run
+    name = validate_name(name)
+    directory = Path(directory).expanduser()
+    if not directory.is_dir():
+        raise ValueError("Delivery input must be an existing directory")
+    mount, dropbox_remote, want_dropbox = _deliver_options(
+        config, no_dropbox, force_supabase)
 
     files = _walk_package_files(directory)
     if not files:
         raise ValueError("Delivery input has no files")
     now = now or utc_now()
-    manifest_path = directory / MANIFEST_NAME
-    if manifest_path.is_file():
-        manifest = load_manifest(manifest_path)
-        manifest_data = manifest_path.read_bytes()
-        manifest_source = "existing"
-    else:
-        manifest_data = _local_manifest(files, name, now)
-        manifest = json.loads(manifest_data.decode("utf-8"))
-        manifest_source = "generated"
+    manifest, manifest_data, manifest_source = _resolve_manifest(
+        directory, files, name, now)
     manifest_sha = hashlib.sha256(manifest_data).hexdigest()
-    file_count = len(manifest["files"])
-    total_bytes = sum(entry["bytes"] for entry in manifest["files"])
-
-    ssh_target = _split_ssh_target(mount)
-    drive_display = mount.rstrip("/") + "/" + name
 
     if dry_run:
-        plan = ["Plan for %s:" % name,
-                "  drive: copy %d file(s) -> %s%s" % (
-                    len(files), drive_display, " over ssh" if ssh_target else "")]
-        if manifest_source == "generated":
-            plan.append("  drive: write generated %s and verify sha256" % MANIFEST_NAME)
-        else:
-            plan.append("  drive: verify sha256 against existing %s" % MANIFEST_NAME)
-        if want_dropbox:
-            plan.append("  dropbox: rclone copy/check/size/link -> %s"
-                        % dropbox_destination(dropbox_remote, name))
-            plan.append("  storage: upload to the configured backend only if Dropbox fails")
-        elif force_supabase:
-            plan.append("  storage: upload to the configured backend (forced)")
-        else:
-            plan.append("  dropbox/storage: skipped (--no-dropbox)")
-        plan.append("  record: write %s and update deliveries.json" % DELIVERY_NAME)
-        return {"dry_run": True, "plan": plan, "name": name}
+        return {"dry_run": True, "name": name,
+                "plan": _deliver_plan(name, mount, files, manifest_source,
+                                      want_dropbox, force_supabase, dropbox_remote)}
 
-    if ssh_target:
-        host, root = ssh_target
-        dest = root.rstrip("/") + "/" + name
-        _copy_drive_ssh(run, host, dest, files, manifest_data, manifest_source)
-        _verify_drive_ssh(run, host, dest, manifest)
-    else:
-        dest = Path(mount).expanduser() / name
-        dest.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(str(directory), str(dest), dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns(DELIVERY_NAME))
-        if manifest_source == "generated":
-            (dest / MANIFEST_NAME).write_bytes(manifest_data)
-            verify_manifest = dest / MANIFEST_NAME
-        else:
-            verify_manifest = manifest_path
-        result = verify_folder(dest, verify_manifest)
-        problems = (len(result["missing"]) + len(result["mismatch"]) +
-                    len(result["extra"]))
-        if problems:
-            raise RuntimeError(
-                "Drive copy verification failed: %d missing, %d mismatch, %d extra"
-                % (len(result["missing"]), len(result["mismatch"]), len(result["extra"])))
+    _copy_and_verify_drive(run, mount, name, directory, files, manifest,
+                           manifest_data, manifest_source)
 
     dropbox_info = None
     if want_dropbox:
@@ -380,26 +424,33 @@ def deliver_package(config, directory, name, days=7, no_dropbox=False,
 
     delivery = {"schema": DELIVERY_SCHEMA, "name": name,
                 "delivered_utc": now.isoformat(timespec="seconds"),
-                "drive_path": drive_display, "files": file_count, "bytes": total_bytes,
+                "drive_path": mount.rstrip("/") + "/" + name,
+                "files": len(manifest["files"]),
+                "bytes": sum(entry["bytes"] for entry in manifest["files"]),
                 "manifest_sha256": manifest_sha, "manifest": manifest_source}
     if dropbox_info:
         delivery["dropbox"] = dropbox_info
     if storage_info:
         delivery["storage"] = storage_info
-
-    delivery_path = directory / DELIVERY_NAME
-    delivery_path.write_text(json.dumps(delivery, ensure_ascii=False, indent=2,
-                                        sort_keys=True) + "\n", encoding="utf-8")
-
-    path = state_path or deliveries_path(config)
-    state = load_deliveries(path)
-    entry = dict(delivery)
-    entry.update({"drive_visible": "unknown", "cleaned": False,
-                  "cleaned_utc": None, "removed": []})
-    state["deliveries"][name] = entry
-    save_deliveries(path, state)
+    delivery_path = _record_delivery(config, delivery, directory, state_path)
     return {"dry_run": False, "delivery": delivery,
             "delivery_path": delivery_path, "markdown": delivery_markdown(delivery)}
+
+
+def _purge_target(entry, dropbox_remote, name):
+    """The recorded (or conventional) Dropbox remote path, guarded to the configured root."""
+    recorded_remote = ((entry or {}).get("dropbox") or {}).get("remote")
+    if recorded_remote:
+        if not dropbox_remote:
+            raise ValueError("DROPBOX_REMOTE is not configured; "
+                             "refusing to purge the recorded Dropbox copy")
+        if not _within_remote(dropbox_remote, recorded_remote):
+            raise ValueError("Refusing to purge %s; it is outside DROPBOX_REMOTE (%s)"
+                             % (recorded_remote, dropbox_remote))
+        return recorded_remote
+    if dropbox_remote:
+        return dropbox_destination(dropbox_remote, name)
+    return None
 
 
 def cleanup_package(config, name, drive_confirmed=False, dry_run=False, run=None,
@@ -411,22 +462,9 @@ def cleanup_package(config, name, drive_confirmed=False, dry_run=False, run=None
     path = state_path or deliveries_path(config)
     state = load_deliveries(path)
     entry = state["deliveries"].get(name)
-
     visible = "yes" if drive_confirmed else drive_visible(config, name, run=run)
-
     dropbox_remote = (config.get("DROPBOX_REMOTE") or "").strip().rstrip("/")
-    recorded_remote = ((entry or {}).get("dropbox") or {}).get("remote")
-    purge_target = None
-    if recorded_remote:
-        if not dropbox_remote:
-            raise ValueError("DROPBOX_REMOTE is not configured; "
-                             "refusing to purge the recorded Dropbox copy")
-        if not _within_remote(dropbox_remote, recorded_remote):
-            raise ValueError("Refusing to purge %s; it is outside DROPBOX_REMOTE (%s)"
-                             % (recorded_remote, dropbox_remote))
-        purge_target = recorded_remote
-    elif dropbox_remote:
-        purge_target = dropbox_destination(dropbox_remote, name)
+    purge_target = _purge_target(entry, dropbox_remote, name)
 
     ledger_path = config.get("_LEDGER_PATH")
     prefix_key = safe_key(name)

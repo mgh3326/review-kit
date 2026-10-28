@@ -141,65 +141,75 @@ def _run_package(args):
     print("Package ready: %s" % output)
 
 
+def _run_deliveries(config, show_all):
+    state = load_deliveries(deliveries_path(config))
+    rows = [(name, entry) for name, entry in sorted(state["deliveries"].items())
+            if show_all or not entry.get("cleaned")]
+    if not rows:
+        print("No deliveries recorded" if show_all
+              else "No deliveries waiting for cleanup")
+        return
+    for name, entry in rows:
+        dropbox = entry.get("dropbox") or {}
+        storage = entry.get("storage") or {}
+        link = dropbox.get("link") or storage.get("index_url") or "-"
+        status = "cleaned" if entry.get("cleaned") else "pending"
+        print("%s\t%s\t%s\t%s\t%s" % (entry.get("delivered_utc", "?"), name, status,
+                                      entry.get("drive_path", "?"), link))
+
+
+def _run_deliver(config, args):
+    result = deliver_package(config, args.directory, args.name, days=args.days,
+                             no_dropbox=args.no_dropbox,
+                             force_supabase=args.force_supabase,
+                             dry_run=args.dry_run, backend_name=args.backend)
+    if result["dry_run"]:
+        for line in result["plan"]:
+            print(line)
+        print("Dry run; nothing was copied or uploaded.")
+        return
+    dropbox = result["delivery"].get("dropbox") or {}
+    if dropbox.get("error"):
+        print("Dropbox step failed; used the storage fallback instead.",
+              file=sys.stderr)
+    print(result["markdown"], end="")
+    print("Wrote %s" % result["delivery_path"])
+
+
+def _run_cleanup(config, args):
+    result = cleanup_package(config, args.name,
+                             drive_confirmed=args.drive_confirmed,
+                             dry_run=args.dry_run, backend_name=args.backend)
+    if result["dry_run"]:
+        for line in result["plan"]:
+            print("Would " + line)
+        if not result["plan"]:
+            print("Nothing to clean up for %s." % result["name"])
+        print("Dry run; nothing was deleted.")
+        return
+    for item in result["removed"]:
+        if item["kind"] == "dropbox":
+            print("Removed Dropbox copy at %s" % item["remote"])
+        else:
+            print("Deleted %d tracked storage objects for %s"
+                  % (item["objects"], item["prefix"]))
+    if not result["removed"]:
+        print("Nothing to clean up for %s." % result["name"])
+
+
 def _run_delivery_command(args):
     config = load_config(args.profile, args.config)
     if args.command == "drive-visible":
         print(drive_visible(config, args.name))
-        return 0
-    if args.command == "deliveries":
-        state = load_deliveries(deliveries_path(config))
-        rows = [(name, entry) for name, entry in sorted(state["deliveries"].items())
-                if args.all or not entry.get("cleaned")]
-        if not rows:
-            print("No deliveries recorded" if args.all
-                  else "No deliveries waiting for cleanup")
-            return 0
-        for name, entry in rows:
-            dropbox = entry.get("dropbox") or {}
-            storage = entry.get("storage") or {}
-            link = dropbox.get("link") or storage.get("index_url") or "-"
-            status = "cleaned" if entry.get("cleaned") else "pending"
-            print("%s\t%s\t%s\t%s\t%s" % (entry.get("delivered_utc", "?"), name, status,
-                                          entry.get("drive_path", "?"), link))
-        return 0
-    if args.command == "deliver":
-        result = deliver_package(config, args.directory, args.name, days=args.days,
-                                 no_dropbox=args.no_dropbox,
-                                 force_supabase=args.force_supabase,
-                                 dry_run=args.dry_run, backend_name=args.backend)
-        if result["dry_run"]:
-            for line in result["plan"]:
-                print(line)
-            print("Dry run; nothing was copied or uploaded.")
-            return 0
-        dropbox = result["delivery"].get("dropbox") or {}
-        if dropbox.get("error"):
-            print("Dropbox step failed; used the storage fallback instead.",
-                  file=sys.stderr)
-        print(result["markdown"], end="")
-        print("Wrote %s" % result["delivery_path"])
-        return 0
-    if args.command == "cleanup":
-        result = cleanup_package(config, args.name,
-                                 drive_confirmed=args.drive_confirmed,
-                                 dry_run=args.dry_run, backend_name=args.backend)
-        if result["dry_run"]:
-            for line in result["plan"]:
-                print("Would " + line)
-            if not result["plan"]:
-                print("Nothing to clean up for %s." % result["name"])
-            print("Dry run; nothing was deleted.")
-            return 0
-        for item in result["removed"]:
-            if item["kind"] == "dropbox":
-                print("Removed Dropbox copy at %s" % item["remote"])
-            else:
-                print("Deleted %d tracked storage objects for %s"
-                      % (item["objects"], item["prefix"]))
-        if not result["removed"]:
-            print("Nothing to clean up for %s." % result["name"])
-        return 0
-    raise ValueError("unsupported command")
+    elif args.command == "deliveries":
+        _run_deliveries(config, args.all)
+    elif args.command == "deliver":
+        _run_deliver(config, args)
+    elif args.command == "cleanup":
+        _run_cleanup(config, args)
+    else:
+        raise ValueError("unsupported command")
+    return 0
 
 
 def _run_verify(args):

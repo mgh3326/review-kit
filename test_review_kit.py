@@ -659,72 +659,75 @@ class FakeTools:
             return listing.encode("utf-8")
         raise AssertionError("unexpected ssh command %r" % command)
 
-    def _rclone(self, args):
-        def positionals(items):
-            out, skip = [], False
-            for index, item in enumerate(items):
-                if skip:
-                    skip = False
-                    continue
-                if item == "--exclude":
-                    skip = True
-                elif not item.startswith("-"):
-                    out.append(item)
-            return out
+    @staticmethod
+    def _positionals(items):
+        out, skip = [], False
+        for item in items:
+            if skip:
+                skip = False
+            elif item == "--exclude":
+                skip = True
+            elif not item.startswith("-"):
+                out.append(item)
+        return out
 
-        command = args[0]
-        if command == "copy":
-            if self.dropbox_fails:
-                raise RuntimeError("rclone failed (exit 1); simulated outage")
-            source = Path(args[1])
-            dest = positionals(args[1:])[1]
-            stored = self.dropbox.setdefault(dest, {})
-            for root, _, names in os.walk(str(source)):
-                for filename in names:
-                    path = Path(root) / filename
-                    relative = path.relative_to(source).as_posix()
-                    if relative == "DELIVERY.json":
-                        continue
-                    stored[relative] = path.read_bytes()
-            return b""
-        if command == "copyto":
-            dest = args[2]
-            parent, _, filename = dest.rpartition("/")
-            self.dropbox.setdefault(parent, {})[filename] = Path(args[1]).read_bytes()
-            return b""
-        if command == "check":
-            source = Path(positionals(args[1:])[0])
-            dest = positionals(args[1:])[1]
-            stored = self.dropbox.get(dest, {})
-            local = {}
-            for root, _, names in os.walk(str(source)):
-                for filename in names:
-                    path = Path(root) / filename
-                    relative = path.relative_to(source).as_posix()
-                    if relative != "DELIVERY.json":
-                        local[relative] = path.read_bytes()
-            if local != {key: stored.get(key) for key in local}:
-                raise RuntimeError("rclone failed (exit 1); differences found")
-            return b""
-        if command == "size":
-            dest = positionals(args[1:])[0]
-            stored = self.dropbox.get(dest, {})
-            return json.dumps({"count": len(stored),
-                               "bytes": sum(len(data) for data in stored.values())}).encode()
-        if command == "link":
-            dest = positionals(args[1:])[0]
-            if dest not in self.dropbox:
-                raise RuntimeError("rclone failed (exit 1); directory not found")
-            return (self.link + "\n").encode("utf-8")
-        if command == "purge":
-            dest = positionals(args[1:])[0]
-            self.dropbox.pop(dest, None)
-            return b""
-        raise AssertionError("unexpected rclone command %r" % args)
+    @staticmethod
+    def _local_files(source):
+        local = {}
+        for root, _, names in os.walk(str(source)):
+            for filename in names:
+                path = Path(root) / filename
+                relative = path.relative_to(source).as_posix()
+                if relative != "DELIVERY.json":
+                    local[relative] = path.read_bytes()
+        return local
+
+    def _rclone_copy(self, args):
+        if self.dropbox_fails:
+            raise RuntimeError("rclone failed (exit 1); simulated outage")
+        dest = self._positionals(args[1:])[1]
+        self.dropbox.setdefault(dest, {}).update(self._local_files(Path(args[1])))
+        return b""
+
+    def _rclone_copyto(self, args):
+        dest = args[2]
+        parent, _, filename = dest.rpartition("/")
+        self.dropbox.setdefault(parent, {})[filename] = Path(args[1]).read_bytes()
+        return b""
+
+    def _rclone_check(self, args):
+        source = Path(self._positionals(args[1:])[0])
+        dest = self._positionals(args[1:])[1]
+        stored = self.dropbox.get(dest, {})
+        local = self._local_files(source)
+        if local != {key: stored.get(key) for key in local}:
+            raise RuntimeError("rclone failed (exit 1); differences found")
+        return b""
+
+    def _rclone_size(self, args):
+        stored = self.dropbox.get(self._positionals(args[1:])[0], {})
+        return json.dumps({"count": len(stored),
+                           "bytes": sum(len(data) for data in stored.values())}).encode()
+
+    def _rclone_link(self, args):
+        dest = self._positionals(args[1:])[0]
+        if dest not in self.dropbox:
+            raise RuntimeError("rclone failed (exit 1); directory not found")
+        return (self.link + "\n").encode("utf-8")
+
+    def _rclone_purge(self, args):
+        self.dropbox.pop(self._positionals(args[1:])[0], None)
+        return b""
+
+    def _rclone(self, args):
+        handler = getattr(self, "_rclone_" + args[0], None)
+        if handler is None:
+            raise AssertionError("unexpected rclone command %r" % args)
+        return handler(args)
 
     def __call__(self, argv, stdin=None, env=None):
         self.calls.append(argv)
-        if isinstance(argv, str):
+        if isinstance(argv, str) or argv[0] in ("sh", "cmd"):
             return self.check_output
         if argv[0] == "ssh":
             return self._ssh(argv[1], argv[2], stdin)
@@ -795,7 +798,7 @@ class DeliverTests(unittest.TestCase):
         self.assertEqual(result2["delivery"]["files"], 2)
 
     def test_existing_manifest_is_reused_and_verified_against(self):
-        first = self._deliver()
+        self._deliver()
         manifest_bytes = (self.drive / "rev-1" / "MANIFEST.json").read_bytes()
         (self.folder / "MANIFEST.json").write_bytes(manifest_bytes)
         second = self._deliver("rev-2")
