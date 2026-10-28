@@ -7,6 +7,8 @@ import sys
 
 from .backends import create_backend
 from .config import load_config
+from .deliver import (cleanup_package, deliver_package, deliveries_path,
+                      drive_visible, load_deliveries)
 from .share import (DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES, done_package,
                     package_status, prune_packages, resign_package, upload_folder)
 from .verify import verify_folder
@@ -67,6 +69,35 @@ def _parser():
     listing = commands.add_parser("ls", help="list remote object keys")
     listing.add_argument("prefix", nargs="?", default="")
 
+    deliver = commands.add_parser(
+        "deliver", help="copy a package to Drive, then Dropbox, then storage as a fallback")
+    deliver.add_argument("directory", type=Path)
+    deliver.add_argument("name")
+    deliver.add_argument("--days", type=int, default=7,
+                         help="signed-link lifetime when the storage fallback is used")
+    fallback = deliver.add_mutually_exclusive_group()
+    fallback.add_argument("--no-dropbox", action="store_true",
+                          help="copy to the Drive mount only")
+    fallback.add_argument("--force-supabase", action="store_true",
+                          help="skip Dropbox and upload to the configured storage backend")
+    deliver.add_argument("--dry-run", action="store_true")
+
+    drive_check = commands.add_parser(
+        "drive-visible", help="report whether the Drive copy is visible in the cloud")
+    drive_check.add_argument("name")
+
+    cleanup = commands.add_parser(
+        "cleanup", help="delete the Dropbox and storage copies once Drive is visible")
+    cleanup.add_argument("name")
+    cleanup.add_argument("--drive-confirmed", action="store_true",
+                         help="skip the Drive visibility check")
+    cleanup.add_argument("--dry-run", action="store_true")
+
+    deliveries = commands.add_parser(
+        "deliveries", help="list deliveries still waiting for cleanup")
+    deliveries.add_argument("--all", action="store_true",
+                            help="include deliveries already cleaned up")
+
     package = commands.add_parser("package", help="assemble videos, stills and a review request")
     package.add_argument("output", type=Path)
     package.add_argument("--video", action="append", default=[], type=Path,
@@ -110,6 +141,77 @@ def _run_package(args):
     print("Package ready: %s" % output)
 
 
+def _run_deliveries(config, show_all):
+    state = load_deliveries(deliveries_path(config))
+    rows = [(name, entry) for name, entry in sorted(state["deliveries"].items())
+            if show_all or not entry.get("cleaned")]
+    if not rows:
+        print("No deliveries recorded" if show_all
+              else "No deliveries waiting for cleanup")
+        return
+    for name, entry in rows:
+        dropbox = entry.get("dropbox") or {}
+        storage = entry.get("storage") or {}
+        link = dropbox.get("link") or storage.get("index_url") or "-"
+        status = "cleaned" if entry.get("cleaned") else "pending"
+        print("%s\t%s\t%s\t%s\t%s" % (entry.get("delivered_utc", "?"), name, status,
+                                      entry.get("drive_path", "?"), link))
+
+
+def _run_deliver(config, args):
+    result = deliver_package(config, args.directory, args.name, days=args.days,
+                             no_dropbox=args.no_dropbox,
+                             force_supabase=args.force_supabase,
+                             dry_run=args.dry_run, backend_name=args.backend)
+    if result["dry_run"]:
+        for line in result["plan"]:
+            print(line)
+        print("Dry run; nothing was copied or uploaded.")
+        return
+    dropbox = result["delivery"].get("dropbox") or {}
+    if dropbox.get("error"):
+        print("Dropbox step failed; used the storage fallback instead.",
+              file=sys.stderr)
+    print(result["markdown"], end="")
+    print("Wrote %s" % result["delivery_path"])
+
+
+def _run_cleanup(config, args):
+    result = cleanup_package(config, args.name,
+                             drive_confirmed=args.drive_confirmed,
+                             dry_run=args.dry_run, backend_name=args.backend)
+    if result["dry_run"]:
+        for line in result["plan"]:
+            print("Would " + line)
+        if not result["plan"]:
+            print("Nothing to clean up for %s." % result["name"])
+        print("Dry run; nothing was deleted.")
+        return
+    for item in result["removed"]:
+        if item["kind"] == "dropbox":
+            print("Removed Dropbox copy at %s" % item["remote"])
+        else:
+            print("Deleted %d tracked storage objects for %s"
+                  % (item["objects"], item["prefix"]))
+    if not result["removed"]:
+        print("Nothing to clean up for %s." % result["name"])
+
+
+def _run_delivery_command(args):
+    config = load_config(args.profile, args.config)
+    if args.command == "drive-visible":
+        print(drive_visible(config, args.name))
+    elif args.command == "deliveries":
+        _run_deliveries(config, args.all)
+    elif args.command == "deliver":
+        _run_deliver(config, args)
+    elif args.command == "cleanup":
+        _run_cleanup(config, args)
+    else:
+        raise ValueError("unsupported command")
+    return 0
+
+
 def _run_verify(args):
     result = verify_folder(args.directory, args.manifest)
     for label, names in (("MISSING", result["missing"]), ("MISMATCH", result["mismatch"]),
@@ -133,6 +235,8 @@ def main(argv=None):
             return 0
         if args.command == "verify":
             return _run_verify(args)
+        if args.command in ("deliver", "drive-visible", "cleanup", "deliveries"):
+            return _run_delivery_command(args)
         config, backend, ledger_path = _backend_and_ledger(args)
         if args.command == "share" and args.share_command == "upload":
             manifest = _load_drive_manifest(args.drive_manifest)

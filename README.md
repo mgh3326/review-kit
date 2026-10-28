@@ -165,6 +165,48 @@ It compares the size and SHA256 of every listed file, prints `MISSING`, `MISMATC
 
 Upload refuses to overwrite any existing storage key unless its recorded SHA256 matches. Use a fresh prefix for each package; run `done` to remove an active package before reusing its prefix.
 
+### Deliver to Drive with Dropbox and storage fallbacks
+
+`deliver` is the one-step version of the manual Drive → Dropbox → storage routine for reviewers who check those locations in order:
+
+```bash
+review-kit --profile work deliver ./review-package pa-review-123
+```
+
+1. The package is copied into `DRIVE_MOUNT_DIR/<name>/`, a local path to a Drive-for-desktop mount or an ssh target such as `host:/path` (each file is streamed over `ssh`, no extra tooling). The copy is verified against `MANIFEST.json` by byte size and SHA256. When the package has no manifest, one is generated with the shared manifest code and written next to the copy.
+2. The package is uploaded to `DROPBOX_REMOTE/<name>` with `rclone copy`, verified with `rclone check` and `rclone size`, and shared with `rclone link`.
+3. Only when the Dropbox step fails does `deliver` fall back to the configured Supabase/S3 backend — the same machinery as `share upload`, with signed links.
+
+The command writes a small `DELIVERY.json` into the package and prints a Markdown snippet with the Drive path, the Dropbox link (or the storage INDEX link), the file count, byte total and manifest SHA256 — paste it into the review request. `DELIVERY.json` is generated and is never copied or counted.
+
+Flags: `--no-dropbox` copies only to the Drive mount, `--force-supabase` skips Dropbox and uploads to storage directly, and `--dry-run` prints the plan without copying or uploading. There is no default remote: `deliver` needs `DRIVE_MOUNT_DIR` and (unless the flags say otherwise) `DROPBOX_REMOTE` in the profile.
+
+```ini
+DRIVE_MOUNT_DIR=/path/to/Drive-mount/reviews
+# or an ssh target: DRIVE_MOUNT_DIR=host:/path/to/drive/reviews
+DROPBOX_REMOTE=dropbox:Project/review
+# optional: a command that prints yes/no once the Drive upload is visible in the cloud
+DRIVE_CHECK_CMD=/path/to/drive-visible.sh
+```
+
+`rclone` and `ssh` must be on `PATH`; rclone needs its own configured Dropbox remote. Delivery names allow letters, digits, dot, underscore, dash and optional `/` nesting.
+
+The Drive-mounted copy counts as delivered even while Drive for desktop is still uploading in the background. `drive-visible` asks a pluggable check whether the cloud copy has appeared: set `DRIVE_CHECK_CMD` to a command that prints `yes` or `no` (it receives `REVIEW_KIT_DRIVE_NAME` and `REVIEW_KIT_DRIVE_PATH` in its environment). Without a hook the answer is `unknown`:
+
+```bash
+review-kit --profile work drive-visible pa-review-123   # prints yes, no or unknown
+```
+
+Once Drive is visible, delete the temporary Dropbox copy and any storage package:
+
+```bash
+review-kit --profile work cleanup pa-review-123 --dry-run
+review-kit --profile work cleanup pa-review-123                     # runs the Drive check first
+review-kit --profile work cleanup pa-review-123 --drive-confirmed   # already confirmed by hand
+```
+
+`cleanup` refuses to run while the check says `no` or `unknown` unless `--drive-confirmed` is passed. The Dropbox deletion is guarded: only the recorded remote path under `DROPBOX_REMOTE` is purged (`rclone purge`), and only ledger-tracked objects are removed from storage (the `done` rules). Every delivery is recorded in `~/.local/state/review-kit/deliveries.json` (set `DELIVERIES_PATH` to move it); `review-kit deliveries` lists the ones still waiting for cleanup and `--all` shows everything.
+
 ## Usage
 
 ```bash

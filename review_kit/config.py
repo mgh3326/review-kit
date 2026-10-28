@@ -48,6 +48,7 @@ def _process_overrides():
         "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN",
         "S3_ADDRESSING_STYLE", "LEDGER_PATH", "SUPABASE_ENV_FILE",
         "S3_ENV_FILE", "PRUNE_HIGH_WATER_MB", "PRUNE_LOW_WATER_MB",
+        "DRIVE_MOUNT_DIR", "DROPBOX_REMOTE", "DRIVE_CHECK_CMD", "DELIVERIES_PATH",
     )
     return {name: os.environ[name] for name in names if name in os.environ}
 
