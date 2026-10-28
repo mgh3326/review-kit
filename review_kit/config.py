@@ -49,6 +49,8 @@ def _process_overrides():
         "S3_ADDRESSING_STYLE", "LEDGER_PATH", "SUPABASE_ENV_FILE",
         "S3_ENV_FILE", "PRUNE_HIGH_WATER_MB", "PRUNE_LOW_WATER_MB",
         "DRIVE_MOUNT_DIR", "DROPBOX_REMOTE", "DRIVE_CHECK_CMD", "DELIVERIES_PATH",
+        "MIRO_ACCESS_TOKEN", "MIRO_ENV_FILE", "MIRO_BASE_URL", "MIRO_MAX_RETRIES",
+        "BOARD_LEDGER_DIR",
     )
     return {name: os.environ[name] for name in names if name in os.environ}
 
@@ -108,6 +110,14 @@ def load_config(profile="default", config_path=None):
     included = values.get("S3_ENV_FILE")
     if included:
         included_values = _s3_env_file_values(included)
+        # Explicit profile and process values override values from the included file.
+        values = {**included_values, **values}
+    included = values.get("MIRO_ENV_FILE")
+    if included:
+        try:
+            included_values = read_env_file(included)
+        except ValueError:
+            raise ValueError("MIRO_ENV_FILE could not be read")
         # Explicit profile and process values override values from the included file.
         values = {**included_values, **values}
     values["_PROFILE"] = profile

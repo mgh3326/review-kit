@@ -207,6 +207,56 @@ review-kit --profile work cleanup pa-review-123 --drive-confirmed   # already co
 
 `cleanup` refuses to run while the check says `no` or `unknown` unless `--drive-confirmed` is passed. The Dropbox deletion is guarded: only the recorded remote path under `DROPBOX_REMOTE` is purged (`rclone purge`), and only ledger-tracked objects are removed from storage (the `done` rules). Every delivery is recorded in `~/.local/state/review-kit/deliveries.json` (set `DELIVERIES_PATH` to move it); `review-kit deliveries` lists the ones still waiting for cleanup and `--all` shows everything.
 
+### Board: Miro wireflow layouts
+
+`review-kit board` lays out captures (Canva exports, game shots, references) on a Miro board from one declarative list file — the repeatable version of ad-hoc placement scripts. It uses only the Miro REST API and the Python standard library.
+
+```ini
+# profile additions
+MIRO_ACCESS_TOKEN=<TOKEN>
+# or keep the token in a separate env file:
+MIRO_ENV_FILE=/path/to/miro-credentials.env
+```
+
+The token is never printed or logged. Rate-limit (HTTP 429) and server errors are retried with `Retry-After`/exponential backoff.
+
+```bash
+review-kit --profile work board place <BOARD_ID> ./wireflow.json
+review-kit --profile work board place <BOARD_ID> ./wireflow.json --dry-run
+review-kit --profile work board place <BOARD_ID> ./wireflow.json --prune
+review-kit --profile work board inventory <BOARD_ID> [--frame <FRAME_ID>] [--json]
+review-kit --profile work board comments <BOARD_ID> [--since 2026-10-25T00:00:00Z] [--json]
+```
+
+List JSON shape:
+
+```json
+{
+  "frame": {"title": "Wireflow v1", "position": "auto:right"},
+  "columns": 3,
+  "cell": {"width": 320, "padding": 24, "header": 48},
+  "items": [
+    {"key": "home", "image": "./shots/home.png", "caption": "Home",
+     "source": "canva", "group": "core"},
+    {"key": "game", "image": "https://example.test/game.png",
+     "caption": "Game", "aspect": 1.78, "group": "core"},
+    {"key": "ref-1", "image": "./refs/ref.png", "caption": "Reference",
+     "source": "reference", "group": "refs"}
+  ],
+  "links": [{"from": "home", "to": "game", "label": "tap"}],
+  "text_updates": {"<WIDGET_ID>": "replacement content"}
+}
+```
+
+- `frame.position`: `{"x": N, "y": N}`, `"auto:right"` (right of the rightmost frame) or `"auto:below"` (below the lowest frame). Existing frame bounds are read first, so the new frame never overlaps.
+- `items[].image`: a local file (PNG/JPEG/GIF/BMP/WebP — dimensions are sniffed for the grid) or an `https://` URL (a Canva export URL works; give `aspect` or `width`/`height` since remote size is unknown, default 4:3).
+- `group` buckets items under a bold header row; `source` is a free-form tag shown in `inventory`.
+- Captions are the Miro image title rendered under each image. Every created widget also carries a hidden `rk:` tag (image description / HTML comment) recording its key and source.
+
+**Idempotent.** `place` records each key → widget id in `~/.local/state/review-kit/board-<BOARD_ID>.json` and embeds the key in the widget. Re-running updates positions, captions and text in place instead of duplicating; a widget deleted on Miro is recreated (PATCH → 404 → POST). Removing an item from the list leaves its widget alone unless `--prune`, which deletes dropped keys and their connectors.
+
+`inventory` prints a markdown table (key / widget id / type / caption / links out / links in / source) so the reviewer doesn't need to spend their own API quota listing the board. `comments` reads board comments with the widget key each is attached to, for collecting change requests; `--since` filters by time and `--json` prints raw rows for both commands.
+
 ## Usage
 
 ```bash

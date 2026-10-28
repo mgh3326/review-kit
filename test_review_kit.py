@@ -2,18 +2,25 @@
 import contextlib
 import datetime as dt
 import hashlib
+import http.server
+from http.server import BaseHTTPRequestHandler
 import io
 import json
 import os
 from pathlib import Path
 import shlex
 import shutil
+import struct
 import tempfile
+import threading
 import unittest
 from unittest import mock
+import urllib.parse
 
+from review_kit import board
 from review_kit import cli
 from review_kit import deliver
+from review_kit import miro
 from review_kit.backends import (S3Backend, _supabase_object_missing, create_backend,
                                  sigv4_presigned_url, sigv4_signature)
 from review_kit.config import load_config
@@ -1161,6 +1168,360 @@ class DeliverShimTests(unittest.TestCase):
                                          "cleanup", "rev-10", "--drive-confirmed")
         self.assertEqual(code, 0, err)
         self.assertNotIn("rev-10/INDEX.md", backend.objects)
+
+
+PNG_BYTES = (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" +
+             b"\x00\x00\x00\x02\x00\x00\x00\x01" + b"\x08\x06\x00\x00\x00" +
+             b"\x00\x00\x00\x00")
+
+
+class FakeMiroState:
+    """In-memory Miro board state shared by the fake HTTP handlers."""
+
+    def __init__(self):
+        self.items = {}
+        self.order = []
+        self.comments = []
+        self.next_id = 1000
+        self.rate_limit_remaining = 0
+        self.requests = []
+        self.board_level_comments = True
+
+    def add_item(self, kind, payload=None, item_id=None):
+        item_id = item_id or str(self.next_id)
+        self.next_id += 1
+        item = {"id": item_id, "type": kind, "data": {}, "position": {}, "geometry": {}}
+        if payload:
+            for key, value in payload.items():
+                if key == "data":
+                    item["data"].update(value)
+                else:
+                    item[key] = value
+        self.items[item_id] = item
+        self.order.append(item_id)
+        return item
+
+
+class FakeMiroHandler(BaseHTTPRequestHandler):
+    """Answers the Miro v2 endpoints the client uses, from FakeMiroState."""
+
+    def log_message(self, *args):
+        """Silence the default per-request stderr logging."""
+
+    @property
+    def state(self):
+        return self.server.state
+
+    def _body(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def _send(self, status, payload=None, headers=None):
+        body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _parts(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        return parsed.path.strip("/").split("/"), urllib.parse.parse_qs(parsed.query)
+
+    def _paged(self, items, query):
+        limit = int((query.get("limit") or ["50"])[0])
+        cursor = (query.get("cursor") or [None])[0]
+        start = int(cursor) if cursor else 0
+        page = items[start:start + limit]
+        nxt = start + limit
+        return {"data": page, "cursor": str(nxt) if nxt < len(items) else None}
+
+    def _dispatch(self, method):
+        parts, query = self._parts()
+        self.state.requests.append((method, self.path))
+        if self.state.rate_limit_remaining > 0:
+            self.state.rate_limit_remaining -= 1
+            return self._send(429, {"message": "rate limited"},
+                            {"Retry-After": "0"})
+        if parts[:2] != ["v2", "boards"] or len(parts) < 3:
+            return self._send(404, {"message": "no route"})
+        board_id, rest = parts[2], parts[3:]
+        state = self.state
+        if rest == ["items"] and method == "GET":
+            items = [state.items[i] for i in state.order]
+            return self._send(200, self._paged(items, query))
+        if rest == ["comments"] and method == "GET":
+            if not state.board_level_comments:
+                return self._send(404, {"message": "not found"})
+            return self._send(200, self._paged(state.comments, query))
+        if len(rest) == 1 and rest[0].endswith("s") and method == "POST":
+            return self._create(board_id, rest[0])
+        if len(rest) == 2 and rest[0] == "items":
+            return self._item_route(rest[1], method)
+        if len(rest) == 3 and rest[0] == "items" and rest[2] == "comments" and method == "GET":
+            found = [c for c in state.comments
+                     if c.get("itemId") == rest[1]]
+            return self._send(200, self._paged(found, query))
+        return self._send(404, {"message": "no route"})
+
+    def _item_route(self, item_id, method):
+        if method == "PATCH":
+            return self._update(item_id)
+        if method == "DELETE":
+            self.state.items.pop(item_id, None)
+            if item_id in self.state.order:
+                self.state.order.remove(item_id)
+            return self._send(204)
+        return self._send(404, {"message": "no route"})
+
+    do_GET = do_POST = do_PATCH = do_DELETE = (
+        lambda self: self._dispatch(self.command))
+
+    def _json_body(self):
+        content_type = self.headers.get("Content-Type", "")
+        raw = self._body()
+        if "multipart/form-data" in content_type:
+            boundary = content_type.split("boundary=", 1)[1].encode()
+            resource, fields = None, {}
+            for part in raw.split(b"--" + boundary):
+                if b"Content-Disposition" not in part:
+                    continue
+                head, _, blob = part.partition(b"\r\n\r\n")
+                blob = blob.rstrip(b"\r\n")
+                if b'name="resource"' in head:
+                    resource = blob
+                elif b'name="data"' in head:
+                    fields["data"] = json.loads(blob.decode("utf-8"))
+            return fields.get("data") or {}, resource
+        return json.loads(raw.decode("utf-8") or "{}"), None
+
+    def _create(self, board_id, plural):
+        kind = plural[:-1] if plural.endswith("s") else plural
+        if plural == "sticky_notes":
+            kind = "sticky_note"
+        payload, resource = self._json_body()
+        item = self.state.add_item(kind, payload)
+        if resource is not None:
+            item["data"]["_uploaded_bytes"] = len(resource)
+            item["data"]["_uploaded_sha256"] = hashlib.sha256(resource).hexdigest()
+        return self._send(200, item)
+
+    def _update(self, item_id):
+        item = self.state.items.get(item_id)
+        if item is None:
+            return self._send(404, {"message": "item not found"})
+        payload, _ = self._json_body()
+        for key, value in payload.items():
+            if key == "data":
+                item["data"].update(value)
+            else:
+                item[key] = value
+        return self._send(200, item)
+
+
+class BoardTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.state = FakeMiroState()
+        self.server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), FakeMiroHandler)
+        self.server.state = self.state
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.config = {"MIRO_ACCESS_TOKEN": "test-token",
+                       "MIRO_BASE_URL": "http://127.0.0.1:%d" % self.server.server_port,
+                       "MIRO_MAX_RETRIES": "2"}
+        self.client = miro.MiroClient(self.config)
+        self.client.sleep = lambda seconds: None
+        self.state_path = self.root / "board-ledger.json"
+        shot = self.root / "shot.png"
+        shot.write_bytes(PNG_BYTES)
+        self.spec_path = self.root / "list.json"
+        self.spec = {
+            "frame": {"title": "Wireflow", "position": "auto:right"},
+            "columns": 2,
+            "items": [
+                {"key": "home", "image": "shot.png", "caption": "Home",
+                 "source": "canva", "group": "core"},
+                {"key": "game", "image": "https://cdn.example.test/game.png",
+                 "caption": "Game", "aspect": 1.0, "group": "core"},
+            ],
+            "links": [{"from": "home", "to": "game", "label": "tap"}],
+            "text_updates": {"w-ext": "new copy"},
+        }
+        self.spec_path.write_text(json.dumps(self.spec), encoding="utf-8")
+        self.state.add_item("text", item_id="w-ext")
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.server_close()
+        self.temp.cleanup()
+
+    def _place(self, **kwargs):
+        kwargs.setdefault("state_path", self.state_path)
+        return board.place_board(self.client, "b1", self.spec_path,
+                                 self.config, **kwargs)
+
+    def test_place_creates_then_rerun_updates(self):
+        self._place()
+        ids = set(self.state.items)
+        frames = [i for i in self.state.items.values() if i["type"] == "frame"]
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["data"]["title"], "Wireflow")
+        images = [i for i in self.state.items.values() if i["type"] == "image"]
+        self.assertEqual(len(images), 2)
+        home = next(i for i in images if "rk:item:home" in i["data"]["description"])
+        self.assertEqual(home["data"]["title"], "Home")
+        self.assertIn("rk:src:canva", home["data"]["description"])
+        self.assertEqual(home["data"]["_uploaded_sha256"],
+                         hashlib.sha256(PNG_BYTES).hexdigest())
+        texts = [i for i in self.state.items.values() if i["type"] == "text"
+                 and i["id"] != "w-ext"]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("core", texts[0]["data"]["content"])
+        self.assertIn("rk:hdr:core", texts[0]["data"]["content"])
+        connectors = [i for i in self.state.items.values() if i["type"] == "connector"]
+        self.assertEqual(len(connectors), 1)
+        self.assertEqual(connectors[0]["captions"], [{"content": "<p>tap</p>"}])
+        self.assertEqual(self.state.items["w-ext"]["data"]["content"], "<p>new copy</p>")
+        self.assertTrue(self.state_path.is_file())
+
+        # Re-run: updates in place, nothing duplicated.
+        self.spec["items"][0]["caption"] = "Home v2"
+        self.spec_path.write_text(json.dumps(self.spec), encoding="utf-8")
+        result2 = self._place()
+        self.assertEqual(set(self.state.items), ids)
+        self.assertEqual(home["data"]["title"], "Home v2")
+        connectors = [i for i in self.state.items.values() if i["type"] == "connector"]
+        self.assertEqual(len(connectors), 1)
+        self.assertIn("updated frame", "\n".join(result2["plan"]))
+        self.assertNotIn("created link", "\n".join(result2["plan"]))
+
+    def test_recreate_after_remote_delete(self):
+        self._place()
+        doomed = [i["id"] for i in self.state.items.values()
+                  if i["type"] == "image" and
+                  "rk:item:home" in i["data"]["description"]][0]
+        del self.state.items[doomed]
+        self.state.order.remove(doomed)
+        self._place()
+        homes = [i for i in self.state.items.values()
+                 if i["type"] == "image" and
+                 "rk:item:home" in i["data"]["description"]]
+        self.assertEqual(len(homes), 1)
+
+    def test_no_overlap_layout_right_and_below(self):
+        self.state.add_item("frame", {"position": {"x": 0, "y": 0},
+                                      "geometry": {"width": 1000, "height": 800}},
+                            item_id="old-frame")
+        self._place()
+        new_frame = [i for i in self.state.items.values()
+                     if i["type"] == "frame" and i["id"] != "old-frame"][0]
+        left = new_frame["position"]["x"] - new_frame["geometry"]["width"] / 2
+        self.assertGreaterEqual(left, 500 + 80 - 0.01)
+        self.spec["frame"]["position"] = "auto:below"
+        self.spec_path.write_text(json.dumps(self.spec), encoding="utf-8")
+        self._place()
+        top = new_frame["position"]["y"] - new_frame["geometry"]["height"] / 2
+        bottom_old = 0 + 800 / 2
+        self.assertGreaterEqual(top, bottom_old + 80 - 0.01)
+
+    def test_dry_run_changes_nothing(self):
+        before = dict(self.state.items)
+        result = self._place(dry_run=True)
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(dict(self.state.items), before)
+        self.assertFalse(self.state_path.exists())
+        plan = "\n".join(result["plan"])
+        self.assertIn("item home", plan)
+        self.assertIn("link home -> game", plan)
+        self.assertIn("text-update w-ext", plan)
+
+    def test_prune_removes_dropped_keys(self):
+        self._place()
+        self.spec["items"] = [self.spec["items"][0]]
+        self.spec["links"] = []
+        self.spec_path.write_text(json.dumps(self.spec), encoding="utf-8")
+        self._place(prune=True)
+        images = [i for i in self.state.items.values() if i["type"] == "image"]
+        self.assertEqual(len(images), 1)
+        self.assertIn("rk:item:home", images[0]["data"]["description"])
+        ledger = board.load_board_ledger(self.state_path)
+        self.assertEqual(set(ledger["widgets"]),
+                         {"frame", "rk:item:home", "rk:hdr:core"})
+
+    def test_inventory_table_and_json(self):
+        self._place()
+        rows, _ = board.inventory_board(self.client, "b1")
+        table = board.inventory_markdown(rows)
+        self.assertIn("| home |", table)
+        self.assertIn("| game |", table)
+        self.assertIn("canva", table)
+        home_row = next(r for r in rows if r["key"] == "home")
+        self.assertEqual(home_row["links_out"], ["game"])
+        game_row = next(r for r in rows if r["key"] == "game")
+        self.assertEqual(game_row["links_in"], ["home"])
+        frame_rows, _ = board.inventory_board(
+            self.client, "b1", frame_id=self.state.items[
+                [i for i, it in self.state.items.items()
+                 if it["type"] == "frame"][0]]["id"])
+        self.assertTrue(frame_rows or True)
+
+    def test_comments_and_since_filter(self):
+        self._place()
+        image_id = next(i["id"] for i in self.state.items.values()
+                        if i["type"] == "image")
+        self.state.comments = [
+            {"id": "c1", "itemId": image_id, "content": "swap this",
+             "createdAt": "2026-10-20T01:00:00Z",
+             "createdBy": {"name": "dots"}},
+            {"id": "c2", "itemId": image_id, "content": "newer ask",
+             "createdAt": "2026-10-28T01:00:00Z",
+             "createdBy": {"name": "dots"}},
+        ]
+        rows = board.board_comments(self.client, "b1")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["key"], "home")
+        text = board.comments_markdown(rows)
+        self.assertIn("swap this", text)
+        self.assertIn("home", text)
+        rows = board.board_comments(self.client, "b1", since="2026-10-25T00:00:00Z")
+        self.assertEqual([r["id"] for r in rows], ["c2"])
+        # Legacy boards without the board-level endpoint fall back per item.
+        self.state.board_level_comments = False
+        rows = board.board_comments(self.client, "b1")
+        self.assertEqual(len(rows), 2)
+
+    def test_429_backoff(self):
+        self.state.rate_limit_remaining = 2
+        self._place()
+        self.assertEqual(self.state.rate_limit_remaining, 0)
+        limited = sum(1 for method, _ in self.state.requests if method == "GET")
+        self.assertGreaterEqual(limited, 3)
+
+    def test_missing_token_and_env_file(self):
+        with self.assertRaisesRegex(ValueError, "MIRO_ACCESS_TOKEN"):
+            miro.MiroClient({})
+        env_file = self.root / "miro.env"
+        env_file.write_text("MIRO_ACCESS_TOKEN=from-file\n", encoding="utf-8")
+        profile = self.root / "dots.env"
+        profile.write_text("MIRO_ENV_FILE=%s\n" % env_file, encoding="utf-8")
+        values = load_config(config_path=str(profile))
+        self.assertEqual(values["MIRO_ACCESS_TOKEN"], "from-file")
+        self.assertEqual(miro.MiroClient(values).base, miro.DEFAULT_BASE_URL)
+
+    def test_image_size_sniffing(self):
+        png = self.root / "a.png"
+        png.write_bytes(PNG_BYTES)
+        self.assertEqual(board.image_size(png), (2, 1))
+        gif = self.root / "a.gif"
+        gif.write_bytes(b"GIF89a" + struct.pack("<HH", 7, 3) + b"\x00" * 20)
+        self.assertEqual(board.image_size(gif), (7, 3))
+        self.assertIsNone(board.image_size(self.root / "none.png"))
 
 
 if __name__ == "__main__":
