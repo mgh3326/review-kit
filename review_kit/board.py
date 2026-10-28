@@ -388,10 +388,11 @@ def _image_create_call(client, board_id, item, payload):
     if item.get("url"):
         data = dict(payload["data"])
         data["url"] = item["url"]
+        create_payload = {key: value for key, value in payload.items()
+                          if key != "data"}
+        create_payload["data"] = data
         return lambda: client.create(board_id, "images",
-                                     payload={"data": data,
-                                              "position": payload["position"],
-                                              "geometry": payload["geometry"]})
+                                     payload=create_payload)
     path = item["file"]
 
     def upload():
@@ -448,12 +449,14 @@ def _place_frame(client, board_id, spec, frames, ledger, result):
 def _place_widgets(client, board_id, spec, layout, fx, fy, ledger, result):
     origin_x, origin_y = fx - layout["width"] / 2, fy - layout["height"] / 2
     widgets = ledger["widgets"]
+    frame_id = ledger.get("frame_id")
+    parent = {"parent": {"id": frame_id}} if frame_id else {}
     for header in layout["headers"]:
         content = "<p><strong>%s</strong></p><!-- %s -->" % (
             header["label"], _header_tag(header["label"]))
         payload = {"data": {"content": content},
                    "position": {"x": origin_x + header["x"], "y": origin_y + header["y"]},
-                   "geometry": {"width": header["w"]}}
+                   "geometry": {"width": header["w"]}, **parent}
         tag = _header_tag(header["label"])
         if result["dry_run"]:
             _board_plan(result, "header", '"%s"' % header["label"])
@@ -465,7 +468,7 @@ def _place_widgets(client, board_id, spec, layout, fx, fy, ledger, result):
         position = {"x": origin_x + cell["x"], "y": origin_y + cell["y"]}
         geometry = {"width": cell["w"], "height": cell["h"]}
         payload = {"data": {"title": item["caption"], "description": _description(item)},
-                   "position": position, "geometry": geometry}
+                   "position": position, "geometry": geometry, **parent}
         tag = _item_tag(item["key"])
         if result["dry_run"]:
             _board_plan(result, "item", "%s (%s)" % (item["key"],
@@ -599,12 +602,18 @@ def _inventory_rows(items):
 def inventory_board(client, board_id, frame_id=None):
     """Rows for the markdown table, plus the raw item data for --json."""
     items = client.items(board_id)
+    connectors = client.connectors(board_id)
     if frame_id:
         items = [item for item in items
                  if item.get("id") == frame_id
                  or (item.get("parent") or {}).get("id") == frame_id
                  or (item.get("parent") == frame_id)]
-    return _inventory_rows(items), items
+        kept = {item.get("id") for item in items}
+        connectors = [c for c in connectors
+                      if set(_connector_ends(c)) & kept]
+    seen = {item.get("id") for item in items}
+    rows_items = items + [c for c in connectors if c.get("id") not in seen]
+    return _inventory_rows(rows_items), items
 
 
 def inventory_markdown(rows):
@@ -620,54 +629,5 @@ def inventory_markdown(rows):
     return "\n".join(lines)
 
 
-# -------------------------------------------------------------------- comments
-
-def _iso_moment(text):
-    try:
-        value = dt.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=dt.timezone.utc)
-    return value
-
-
-def _comment_row(comment, items):
-    created = comment.get("createdAt") or comment.get("created_at") or ""
-    modified = comment.get("modifiedAt") or comment.get("modified_at") or ""
-    item_id = comment.get("itemId") or comment.get("item_id")
-    widget = items.get(item_id)
-    author = comment.get("createdBy") or comment.get("created_by") or {}
-    return {"id": comment.get("id"), "item_id": item_id,
-            "key": _item_key(widget) if widget else None,
-            "author": author.get("name") or author.get("id") or "-",
-            "created": created, "modified": modified,
-            "resolved": bool(comment.get("resolved")
-                             or comment.get("status") == "resolved"),
-            "content": comment.get("content")
-            or (comment.get("data") or {}).get("content") or "",
-            "_moment": _iso_moment(modified) or _iso_moment(created)}
-
-
-def board_comments(client, board_id, since=None):
-    """Normalized comment rows with the widget key they are attached to."""
-    items = {item.get("id"): item for item in client.items(board_id)}
-    since_moment = _iso_moment(since) if since else None
-    rows = []
-    for comment in client.comments(board_id):
-        row = _comment_row(comment, items)
-        if since_moment and (not row["_moment"] or row["_moment"] < since_moment):
-            continue
-        del row["_moment"]
-        rows.append(row)
-    return rows
-
-
-def comments_markdown(rows):
-    lines = []
-    for row in rows:
-        widget = row["key"] or row["item_id"] or "board"
-        flag = " [resolved]" if row["resolved"] else ""
-        lines.append("- %s%s `%s` **%s**: %s" % (
-            row["created"], flag, widget, row["author"], row["content"]))
-    return "\n".join(lines)
+COMMENTS_UNAVAILABLE = ("Comments are not available via the Miro REST API; "
+                        "use the Miro MCP comment tools or the board UI.")

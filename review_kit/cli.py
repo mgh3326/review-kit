@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 from .backends import create_backend
-from .board import (board_comments, comments_markdown, inventory_board,
+from .board import (COMMENTS_UNAVAILABLE, inventory_board,
                     inventory_markdown, place_board)
 from .config import load_config
 from .deliver import (cleanup_package, deliver_package, deliveries_path,
@@ -116,11 +116,10 @@ def _parser():
     inventory.add_argument("board_id")
     inventory.add_argument("--frame", help="only items inside this frame id")
     inventory.add_argument("--json", action="store_true")
-    comments = board_commands.add_parser("comments",
-                                         help="read board comments with their widgets")
+    comments = board_commands.add_parser(
+        "comments",
+        help="not available via Miro REST; points to MCP comment tools")
     comments.add_argument("board_id")
-    comments.add_argument("--since", help="ISO-8601 timestamp; only newer comments")
-    comments.add_argument("--json", action="store_true")
 
     package = commands.add_parser("package", help="assemble videos, stills and a review request")
     package.add_argument("output", type=Path)
@@ -254,19 +253,13 @@ def _board_inventory(client, config, args):
         print(inventory_markdown(rows))
 
 
-def _board_comments(client, config, args):
-    rows = board_comments(client, args.board_id, since=args.since)
-    if args.json:
-        print(json.dumps(rows, ensure_ascii=False, indent=2))
-    else:
-        print(comments_markdown(rows) or "No comments")
-
-
 def _run_board_command(args):
     config = load_config(args.profile, args.config)
+    if args.board_command == "comments":
+        print(COMMENTS_UNAVAILABLE)
+        return 2
     client = MiroClient(config)
-    handlers = {"place": _board_place, "inventory": _board_inventory,
-                "comments": _board_comments}
+    handlers = {"place": _board_place, "inventory": _board_inventory}
     handler = handlers.get(args.board_command)
     if handler is None:
         raise ValueError("unsupported command")

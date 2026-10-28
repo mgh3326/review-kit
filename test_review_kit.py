@@ -1181,11 +1181,9 @@ class FakeMiroState:
     def __init__(self):
         self.items = {}
         self.order = []
-        self.comments = []
         self.next_id = 1000
         self.rate_limit_remaining = 0
         self.requests = []
-        self.board_level_comments = True
 
     def add_item(self, kind, payload=None, item_id=None):
         item_id = item_id or str(self.next_id)
@@ -1250,20 +1248,19 @@ class FakeMiroHandler(BaseHTTPRequestHandler):
         board_id, rest = parts[2], parts[3:]
         state = self.state
         if rest == ["items"] and method == "GET":
-            items = [state.items[i] for i in state.order]
+            items = [state.items[i] for i in state.order
+                     if state.items[i]["type"] != "connector"]
             return self._send(200, self._paged(items, query))
+        if rest == ["connectors"] and method == "GET":
+            found = [state.items[i] for i in state.order
+                     if state.items[i]["type"] == "connector"]
+            return self._send(200, self._paged(found, query))
         if rest == ["comments"] and method == "GET":
-            if not state.board_level_comments:
-                return self._send(404, {"message": "not found"})
-            return self._send(200, self._paged(state.comments, query))
+            return self._send(400, {"message": "bad request"})
         if len(rest) == 1 and rest[0].endswith("s") and method == "POST":
             return self._create(board_id, rest[0])
         if len(rest) == 2 and rest[0] == "items":
             return self._item_route(rest[1], method)
-        if len(rest) == 3 and rest[0] == "items" and rest[2] == "comments" and method == "GET":
-            found = [c for c in state.comments
-                     if c.get("itemId") == rest[1]]
-            return self._send(200, self._paged(found, query))
         return self._send(404, {"message": "no route"})
 
     def _item_route(self, item_id, method):
@@ -1471,30 +1468,26 @@ class BoardTests(unittest.TestCase):
                  if it["type"] == "frame"][0]]["id"])
         self.assertTrue(frame_rows or True)
 
-    def test_comments_and_since_filter(self):
+    def test_inventory_links_from_board_level_connectors(self):
+        """Connectors are board-level items, not frame children."""
         self._place()
-        image_id = next(i["id"] for i in self.state.items.values()
-                        if i["type"] == "image")
-        self.state.comments = [
-            {"id": "c1", "itemId": image_id, "content": "swap this",
-             "createdAt": "2026-10-20T01:00:00Z",
-             "createdBy": {"name": "dots"}},
-            {"id": "c2", "itemId": image_id, "content": "newer ask",
-             "createdAt": "2026-10-28T01:00:00Z",
-             "createdBy": {"name": "dots"}},
-        ]
-        rows = board.board_comments(self.client, "b1")
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["key"], "home")
-        text = board.comments_markdown(rows)
-        self.assertIn("swap this", text)
-        self.assertIn("home", text)
-        rows = board.board_comments(self.client, "b1", since="2026-10-25T00:00:00Z")
-        self.assertEqual([r["id"] for r in rows], ["c2"])
-        # Legacy boards without the board-level endpoint fall back per item.
-        self.state.board_level_comments = False
-        rows = board.board_comments(self.client, "b1")
-        self.assertEqual(len(rows), 2)
+        frame_id = next(i["id"] for i in self.state.items.values()
+                        if i["type"] == "frame")
+        rows, _ = board.inventory_board(self.client, "b1", frame_id=frame_id)
+        home_row = next(r for r in rows if r["key"] == "home")
+        self.assertEqual(home_row["links_out"], ["game"])
+        game_row = next(r for r in rows if r["key"] == "game")
+        self.assertEqual(game_row["links_in"], ["home"])
+
+    def test_comments_command_exits_2(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(["--config", str(self.root / "none.env"),
+                             "board", "comments", "b1"])
+        self.assertEqual(code, 2)
+        self.assertIn("not available via the Miro REST API", out.getvalue())
+        self.assertFalse(any(path.endswith("/comments")
+                             for _, path in self.state.requests))
 
     def test_429_backoff(self):
         self.state.rate_limit_remaining = 2
