@@ -6,12 +6,14 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import tempfile
 import unittest
 from unittest import mock
 
 from review_kit import cli
+from review_kit import deliver
 from review_kit.backends import (S3Backend, _supabase_object_missing, create_backend,
                                  sigv4_presigned_url, sigv4_signature)
 from review_kit.config import load_config
@@ -616,6 +618,546 @@ class PackageTests(unittest.TestCase):
             readme = (output / "README_review_request.md").read_text(encoding="utf-8")
             self.assertIn("Check state A", readme)
             self.assertIn("Reply format", readme)
+
+
+class FakeTools:
+    """In-memory stand-ins for the ssh and rclone commands deliver.py calls."""
+
+    def __init__(self):
+        self.remote_fs = {}   # remote dest path -> {relative path: bytes}
+        self.dropbox = {}     # remote path -> {relative path: bytes}
+        self.calls = []
+        self.check_output = b""
+        self.dropbox_fails = False
+        self.link = "https://dropbox.example.test/share-link"
+
+    @staticmethod
+    def _unquote(text):
+        return shlex.split(text)[0]
+
+    def _ssh(self, host, command, stdin):
+        if command.startswith("mkdir -p -- "):
+            dest = self._unquote(command[len("mkdir -p -- "):])
+            self.remote_fs.setdefault(dest, {})
+            return b""
+        if not command.startswith("cd "):
+            raise AssertionError("unexpected ssh command %r" % command)
+        dest_raw, inner = command[3:].split(" && ", 1)
+        dest = self._unquote(dest_raw)
+        files = self.remote_fs.setdefault(dest, {})
+        if inner.startswith("mkdir -p -- "):
+            _, after = inner.split(" && cat > ./", 1)
+            files[self._unquote(after)] = stdin
+            return b""
+        if inner.startswith("cat ./"):
+            relative = self._unquote(inner[len("cat ./"):])
+            if relative not in files:
+                raise RuntimeError("cat failed (exit 1); No such file")
+            return files[relative]
+        if inner.startswith("find"):
+            listing = "".join("./%s\n" % name for name in sorted(files))
+            return listing.encode("utf-8")
+        raise AssertionError("unexpected ssh command %r" % command)
+
+    def _rclone(self, args):
+        def positionals(items):
+            out, skip = [], False
+            for index, item in enumerate(items):
+                if skip:
+                    skip = False
+                    continue
+                if item == "--exclude":
+                    skip = True
+                elif not item.startswith("-"):
+                    out.append(item)
+            return out
+
+        command = args[0]
+        if command == "copy":
+            if self.dropbox_fails:
+                raise RuntimeError("rclone failed (exit 1); simulated outage")
+            source = Path(args[1])
+            dest = positionals(args[1:])[1]
+            stored = self.dropbox.setdefault(dest, {})
+            for root, _, names in os.walk(str(source)):
+                for filename in names:
+                    path = Path(root) / filename
+                    relative = path.relative_to(source).as_posix()
+                    if relative == "DELIVERY.json":
+                        continue
+                    stored[relative] = path.read_bytes()
+            return b""
+        if command == "copyto":
+            dest = args[2]
+            parent, _, filename = dest.rpartition("/")
+            self.dropbox.setdefault(parent, {})[filename] = Path(args[1]).read_bytes()
+            return b""
+        if command == "check":
+            source = Path(positionals(args[1:])[0])
+            dest = positionals(args[1:])[1]
+            stored = self.dropbox.get(dest, {})
+            local = {}
+            for root, _, names in os.walk(str(source)):
+                for filename in names:
+                    path = Path(root) / filename
+                    relative = path.relative_to(source).as_posix()
+                    if relative != "DELIVERY.json":
+                        local[relative] = path.read_bytes()
+            if local != {key: stored.get(key) for key in local}:
+                raise RuntimeError("rclone failed (exit 1); differences found")
+            return b""
+        if command == "size":
+            dest = positionals(args[1:])[0]
+            stored = self.dropbox.get(dest, {})
+            return json.dumps({"count": len(stored),
+                               "bytes": sum(len(data) for data in stored.values())}).encode()
+        if command == "link":
+            dest = positionals(args[1:])[0]
+            if dest not in self.dropbox:
+                raise RuntimeError("rclone failed (exit 1); directory not found")
+            return (self.link + "\n").encode("utf-8")
+        if command == "purge":
+            dest = positionals(args[1:])[0]
+            self.dropbox.pop(dest, None)
+            return b""
+        raise AssertionError("unexpected rclone command %r" % args)
+
+    def __call__(self, argv, stdin=None, env=None):
+        self.calls.append(argv)
+        if isinstance(argv, str):
+            return self.check_output
+        if argv[0] == "ssh":
+            return self._ssh(argv[1], argv[2], stdin)
+        if argv[0] == "rclone":
+            return self._rclone(list(argv[1:]))
+        raise AssertionError("unexpected command %r" % (argv,))
+
+
+class DeliverTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.folder = self.root / "pkg"
+        (self.folder / "stills").mkdir(parents=True)
+        (self.folder / "README_review_request.md").write_text("review me", encoding="utf-8")
+        (self.folder / "stills" / "a.png").write_bytes(b"png-bytes")
+        self.drive = self.root / "drive"
+        self.drive.mkdir()
+        self.ledger = self.root / "dots.ledger.json"
+        self.state = self.root / "deliveries.json"
+        self.config = {"DRIVE_MOUNT_DIR": str(self.drive),
+                       "DROPBOX_REMOTE": "dropbox:Project/review",
+                       "_LEDGER_PATH": str(self.ledger),
+                       "DELIVERIES_PATH": str(self.state)}
+        self.tools = FakeTools()
+        self.backend = FakeBackend()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _deliver(self, name="rev-1", **kwargs):
+        kwargs.setdefault("run", self.tools)
+        kwargs.setdefault("backend_factory", lambda config, backend=None: self.backend)
+        return deliver.deliver_package(self.config, self.folder, name, **kwargs)
+
+    def test_validate_name_and_ssh_target_parsing(self):
+        self.assertEqual(deliver.validate_name("2026-10-28/rev-1"), "2026-10-28/rev-1")
+        for bad in ("", "a b", "../evil", "a//b", "-flag", ".hidden", "a:b"):
+            with self.assertRaises(ValueError, msg=bad):
+                deliver.validate_name(bad)
+        self.assertEqual(deliver._split_ssh_target("mbp:/Volumes/Drive"), ("mbp", "/Volumes/Drive"))
+        self.assertEqual(deliver._split_ssh_target("me@mbp:~/Drive"), ("me@mbp", "~/Drive"))
+        self.assertIsNone(deliver._split_ssh_target("/Volumes/Drive"))
+        self.assertIsNone(deliver._split_ssh_target("~/Drive"))
+        self.assertIsNone(deliver._split_ssh_target("C:\\Drive"))
+
+    def test_deliver_copies_to_drive_then_dropbox_and_records_state(self):
+        result = self._deliver()
+        copied = self.drive / "rev-1"
+        self.assertEqual((copied / "README_review_request.md").read_text(encoding="utf-8"),
+                         "review me")
+        self.assertTrue((copied / "MANIFEST.json").is_file())  # generated next to the copy
+        info = result["delivery"]
+        self.assertEqual(info["manifest"], "generated")
+        self.assertEqual(info["dropbox"]["link"], "https://dropbox.example.test/share-link")
+        self.assertEqual(info["files"], 2)
+        stored = self.tools.dropbox["dropbox:Project/review/rev-1"]
+        self.assertEqual(sorted(stored),
+                         ["MANIFEST.json", "README_review_request.md", "stills/a.png"])
+        self.assertIn("- Dropbox: <https://dropbox.example.test/share-link>", result["markdown"])
+        entry = deliver.load_deliveries(self.state)["deliveries"]["rev-1"]
+        self.assertEqual(entry["drive_path"], str(self.drive) + "/rev-1")
+        self.assertFalse(entry["cleaned"])
+        delivery_file = json.loads((self.folder / "DELIVERY.json").read_text(encoding="utf-8"))
+        self.assertEqual(delivery_file["manifest_sha256"], info["manifest_sha256"])
+        # A second run ignores the generated DELIVERY.json instead of failing verify.
+        result2 = self._deliver()
+        self.assertEqual(result2["delivery"]["files"], 2)
+
+    def test_existing_manifest_is_reused_and_verified_against(self):
+        first = self._deliver()
+        manifest_bytes = (self.drive / "rev-1" / "MANIFEST.json").read_bytes()
+        (self.folder / "MANIFEST.json").write_bytes(manifest_bytes)
+        second = self._deliver("rev-2")
+        self.assertEqual(second["delivery"]["manifest"], "existing")
+        self.assertEqual((self.drive / "rev-2" / "MANIFEST.json").read_bytes(), manifest_bytes)
+        (self.folder / "stills" / "a.png").write_bytes(b"tampered")
+        with self.assertRaisesRegex(RuntimeError, "verification failed"):
+            self._deliver("rev-3")
+
+    def test_dropbox_failure_falls_back_to_storage(self):
+        self.tools.dropbox_fails = True
+        result = self._deliver()
+        delivery = result["delivery"]
+        self.assertIn("error", delivery["dropbox"])
+        self.assertIn("index_url", delivery["storage"])
+        self.assertIn("- Storage INDEX: <https://storage.example.test/rev-1/INDEX.md",
+                      result["markdown"])
+        record = load_ledger(self.ledger)["packages"]["rev-1"]
+        self.assertTrue(any(obj["file"] == "README_review_request.md"
+                            for obj in record["objects"]))
+        # rclone never reached the link step.
+        self.assertFalse(any(call[0:2] == ["rclone", "link"]
+                             for call in self.tools.calls if not isinstance(call, str)))
+
+    def test_no_dropbox_and_force_supabase_modes(self):
+        result = self._deliver("only-drive", no_dropbox=True)
+        self.assertNotIn("dropbox", result["delivery"])
+        self.assertIn("(Drive copy only)", result["markdown"])
+        self.assertEqual(self.tools.dropbox, {})
+        result = self._deliver("only-storage", force_supabase=True)
+        self.assertIn("index_url", result["delivery"]["storage"])
+        self.assertEqual(self.tools.dropbox, {})
+        with self.assertRaises(ValueError):
+            self._deliver("clash", no_dropbox=True, force_supabase=True)
+
+    def test_missing_configuration_and_dry_run(self):
+        with self.assertRaisesRegex(ValueError, "DROPBOX_REMOTE"):
+            deliver.deliver_package({**self.config, "DROPBOX_REMOTE": ""},
+                                    self.folder, "x", run=self.tools)
+        with self.assertRaisesRegex(ValueError, "DRIVE_MOUNT_DIR"):
+            deliver.deliver_package({**self.config, "DRIVE_MOUNT_DIR": ""},
+                                    self.folder, "x", run=self.tools)
+        result = self._deliver("planned", dry_run=True)
+        self.assertTrue(result["dry_run"])
+        self.assertFalse((self.drive / "planned").exists())
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.tools.calls, [])
+        self.assertFalse(any(call for call in self.tools.calls))
+
+    def test_ssh_drive_copy_and_verify(self):
+        config = dict(self.config, DRIVE_MOUNT_DIR="mbp:/Volumes/Drive")
+        result = deliver.deliver_package(config, self.folder, "ssh-rev", run=self.tools)
+        remote = self.tools.remote_fs["/Volumes/Drive/ssh-rev"]
+        self.assertEqual(remote["README_review_request.md"], b"review me")
+        self.assertEqual(remote["stills/a.png"], b"png-bytes")
+        self.assertIn("MANIFEST.json", remote)
+        self.assertEqual(result["delivery"]["drive_path"], "mbp:/Volumes/Drive/ssh-rev")
+        # Corrupt one remote byte: the next delivery to a new name verifies fresh,
+        # but the recorded copy is what it is; simulate a mismatch by tampering
+        # then verifying the same dest fails via a fresh verify pass.
+        remote["stills/a.png"] = b"changed"
+        with self.assertRaisesRegex(RuntimeError, "verification failed"):
+            deliver._verify_drive_ssh(self.tools, "mbp", "/Volumes/Drive/ssh-rev",
+                                      json.loads(remote["MANIFEST.json"]))
+
+    def test_drive_visible_hook(self):
+        for output, expected in ((b"yes\n", "yes"), (b"NO\n", "no"),
+                                 (b"maybe\n", "unknown"), (b"", "unknown")):
+            self.tools.check_output = output
+            config = dict(self.config, DRIVE_CHECK_CMD="check-command")
+            self.assertEqual(deliver.drive_visible(config, "rev-1", run=self.tools),
+                             expected)
+        self.assertEqual(deliver.drive_visible(self.config, "rev-1", run=self.tools),
+                         "unknown")
+        def failing(argv, stdin=None, env=None):
+            raise RuntimeError("boom")
+        self.assertEqual(deliver.drive_visible(config, "rev-1", run=failing), "unknown")
+
+    def test_cleanup_requires_drive_visibility_then_purges(self):
+        self._deliver()
+        config = dict(self.config)  # no DRIVE_CHECK_CMD -> unknown
+        with self.assertRaisesRegex(RuntimeError, "not confirmed visible"):
+            deliver.cleanup_package(config, "rev-1", run=self.tools)
+        self.assertIn("dropbox:Project/review/rev-1", self.tools.dropbox)
+
+        self.tools.check_output = b"no\n"
+        config["DRIVE_CHECK_CMD"] = "check-command"
+        with self.assertRaisesRegex(RuntimeError, "not confirmed visible"):
+            deliver.cleanup_package(config, "rev-1", run=self.tools)
+
+        dry = deliver.cleanup_package(config, "rev-1", dry_run=True,
+                                      drive_confirmed=True, run=self.tools)
+        self.assertTrue(any("rclone purge dropbox:Project/review/rev-1" in line
+                            for line in dry["plan"]))
+        self.assertIn("dropbox:Project/review/rev-1", self.tools.dropbox)
+
+        result = deliver.cleanup_package(config, "rev-1", drive_confirmed=True,
+                                         run=self.tools)
+        self.assertEqual(result["removed"],
+                         [{"kind": "dropbox", "remote": "dropbox:Project/review/rev-1"}])
+        self.assertNotIn("dropbox:Project/review/rev-1", self.tools.dropbox)
+        entry = deliver.load_deliveries(self.state)["deliveries"]["rev-1"]
+        self.assertTrue(entry["cleaned"])
+        self.assertEqual(entry["removed"], result["removed"])
+
+    def test_cleanup_guard_refuses_paths_outside_the_remote(self):
+        self._deliver()
+        state = deliver.load_deliveries(self.state)
+        state["deliveries"]["rev-1"]["dropbox"]["remote"] = "other-remote:elsewhere/rev-1"
+        deliver.save_deliveries(self.state, state)
+        with self.assertRaisesRegex(ValueError, "outside DROPBOX_REMOTE"):
+            deliver.cleanup_package(self.config, "rev-1", drive_confirmed=True,
+                                    run=self.tools)
+        self.assertIn("dropbox:Project/review/rev-1", self.tools.dropbox)
+        with self.assertRaisesRegex(ValueError, "outside DROPBOX_REMOTE|Delivery name"):
+            deliver.cleanup_package(self.config, "../escape", drive_confirmed=True,
+                                    run=self.tools)
+        with self.assertRaisesRegex(ValueError, "rclone remote path"):
+            deliver.dropbox_destination("not-a-remote", "rev-1")
+
+    def test_cleanup_removes_the_storage_package_too(self):
+        self.tools.dropbox_fails = True
+        self._deliver()
+        result = deliver.cleanup_package(self.config, "rev-1", drive_confirmed=True,
+                                         run=self.tools,
+                                         backend_factory=lambda config, backend=None: self.backend)
+        kinds = {item["kind"] for item in result["removed"]}
+        self.assertEqual(kinds, {"dropbox", "storage"})
+        self.assertNotIn("rev-1", load_ledger(self.ledger)["packages"])
+        self.assertEqual(self.backend.objects, {})
+
+    def test_cli_deliveries_listing(self):
+        self._deliver("rev-pending")
+        deliver.cleanup_package(self.config, "rev-pending", drive_confirmed=True,
+                                run=self.tools)
+        self._deliver("rev-waiting")
+
+        def run(*argv):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = cli.main(list(argv))
+            return code, out.getvalue()
+
+        profile = self.root / "x.env"
+        profile.write_text("DELIVERIES_PATH=%s\n" % self.state, encoding="utf-8")
+        code, out = run("--config", str(profile), "deliveries")
+        self.assertEqual(code, 0)
+        self.assertIn("rev-waiting", out)
+        self.assertNotIn("rev-pending", out)
+        code, out = run("--config", str(profile), "deliveries", "--all")
+        self.assertIn("rev-pending", out)
+
+
+SSH_SHIM = '''#!/usr/bin/env python3
+import os
+import shlex
+import sys
+
+root = os.environ["FAKE_SSH_ROOT"]
+
+
+def mounted(path):
+    return os.path.join(root, path.lstrip("/"))
+
+
+command = sys.argv[2]
+if command.startswith("mkdir -p -- "):
+    os.makedirs(mounted(shlex.split(command[len("mkdir -p -- "):])[0]), exist_ok=True)
+elif command.startswith("cd "):
+    dest_raw, inner = command[3:].split(" && ", 1)
+    dest = mounted(shlex.split(dest_raw)[0])
+    if inner.startswith("mkdir -p -- "):
+        before, after = inner.split(" && cat > ./", 1)
+        os.makedirs(os.path.join(dest, shlex.split(before[len("mkdir -p -- "):])[0]),
+                    exist_ok=True)
+        with open(os.path.join(dest, shlex.split(after)[0]), "wb") as target:
+            target.write(sys.stdin.buffer.read())
+    elif inner.startswith("cat ./"):
+        path = os.path.join(dest, shlex.split(inner[len("cat ./"):])[0])
+        with open(path, "rb") as source:
+            sys.stdout.buffer.write(source.read())
+    elif inner.startswith("find"):
+        found = []
+        for current, _, names in os.walk(dest):
+            for filename in names:
+                found.append("./" + os.path.relpath(os.path.join(current, filename), dest))
+        sys.stdout.write("".join(name + "\\n" for name in sorted(found)))
+    else:
+        sys.stderr.write("unsupported: " + inner)
+        sys.exit(2)
+else:
+    sys.stderr.write("unsupported: " + command)
+    sys.exit(2)
+'''
+
+RCLONE_SHIM = '''#!/usr/bin/env python3
+import json
+import os
+import shutil
+import sys
+
+root = os.environ["FAKE_RCLONE_ROOT"]
+
+
+def mounted(path):
+    return os.path.join(root, path.split(":", 1)[1].lstrip("/"))
+
+
+def positionals(items):
+    out = []
+    index = 0
+    while index < len(items):
+        item = items[index]
+        if item == "--exclude":
+            index += 2
+            continue
+        if not item.startswith("-"):
+            out.append(item)
+        index += 1
+    return out
+
+
+def excluded(args):
+    if "--exclude" in args:
+        return args[args.index("--exclude") + 1].lstrip("/")
+    return None
+
+
+def local_files(source, skip):
+    found = {}
+    for current, _, names in os.walk(source):
+        for filename in names:
+            path = os.path.join(current, filename)
+            relative = os.path.relpath(path, source).replace(os.sep, "/")
+            if relative != skip:
+                found[relative] = path
+    return found
+
+
+args = sys.argv[1:]
+command = args[0]
+if command == "copy":
+    if os.environ.get("FAKE_RCLONE_FAIL_COPY"):
+        sys.exit(1)
+    source, dest = positionals(args[1:])
+    skip = excluded(args[1:])
+    for relative, path in local_files(source, skip).items():
+        target = os.path.join(mounted(dest), relative)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(path, target)
+elif command == "copyto":
+    target = mounted(positionals(args[1:])[1])
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copy2(positionals(args[1:])[0], target)
+elif command == "check":
+    source, dest = positionals(args[1:])
+    skip = excluded(args[1:])
+    for relative, path in local_files(source, skip).items():
+        remote = os.path.join(mounted(dest), relative)
+        if not os.path.isfile(remote):
+            sys.exit(1)
+        with open(path, "rb") as left, open(remote, "rb") as right:
+            if left.read() != right.read():
+                sys.exit(1)
+elif command == "size":
+    dest = mounted(positionals(args[1:])[0])
+    count = total = 0
+    for current, _, names in os.walk(dest):
+        for filename in names:
+            count += 1
+            total += os.path.getsize(os.path.join(current, filename))
+    print(json.dumps({"count": count, "bytes": total}))
+elif command == "link":
+    print("https://dropbox.example.test/" + positionals(args[1:])[0])
+elif command == "purge":
+    shutil.rmtree(mounted(positionals(args[1:])[0]), ignore_errors=True)
+else:
+    sys.stderr.write("unsupported: " + command)
+    sys.exit(2)
+'''
+
+
+@unittest.skipIf(os.name == "nt", "PATH shim tests need a POSIX shell environment")
+class DeliverShimTests(unittest.TestCase):
+    """End-to-end deliver/cleanup through fake ssh and rclone binaries on PATH."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.shim = self.root / "shim"
+        self.shim.mkdir()
+        for name, body in (("ssh", SSH_SHIM), ("rclone", RCLONE_SHIM)):
+            path = self.shim / name
+            path.write_text(body, encoding="utf-8")
+            path.chmod(0o755)
+        self.fake_ssh = self.root / "ssh-root"
+        self.fake_rclone = self.root / "rclone-root"
+        self.fake_ssh.mkdir()
+        self.fake_rclone.mkdir()
+        self.folder = self.root / "pkg"
+        self.folder.mkdir()
+        (self.folder / "README_review_request.md").write_text("review me", encoding="utf-8")
+        (self.folder / "shot.png").write_bytes(b"png")
+        self.profile = self.root / "dots.env"
+        self.profile.write_text(
+            "DRIVE_MOUNT_DIR=fakehost:/remote/drive\n"
+            "DROPBOX_REMOTE=fakedb:Project/review\n"
+            "DRIVE_CHECK_CMD=printf yes\n", encoding="utf-8")
+        self.state_dir = self.root / "state"
+        self.env_patcher = mock.patch.dict(os.environ)
+        self.env_patcher.start()
+        os.environ["PATH"] = str(self.shim) + os.pathsep + os.environ["PATH"]
+        os.environ["FAKE_SSH_ROOT"] = str(self.fake_ssh)
+        os.environ["FAKE_RCLONE_ROOT"] = str(self.fake_rclone)
+        os.environ["REVIEW_KIT_STATE_DIR"] = str(self.state_dir)
+
+    def tearDown(self):
+        self.env_patcher.stop()
+        self.temp.cleanup()
+
+    def _run_cli(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_deliver_over_ssh_and_rclone_then_cleanup(self):
+        code, out, err = self._run_cli("--config", str(self.profile),
+                                     "deliver", str(self.folder), "rev-9")
+        self.assertEqual(code, 0, err)
+        remote = self.fake_ssh / "remote" / "drive" / "rev-9"
+        self.assertEqual((remote / "shot.png").read_bytes(), b"png")
+        self.assertTrue((remote / "MANIFEST.json").is_file())
+        dropbox_copy = self.fake_rclone / "Project" / "review" / "rev-9"
+        self.assertEqual((dropbox_copy / "shot.png").read_bytes(), b"png")
+        self.assertIn("https://dropbox.example.test/fakedb:Project/review/rev-9", out)
+        code, out, _ = self._run_cli("--config", str(self.profile), "deliveries")
+        self.assertEqual(code, 0)
+        self.assertIn("rev-9", out)
+
+        code, out, err = self._run_cli("--config", str(self.profile), "cleanup", "rev-9")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(dropbox_copy.exists())
+        code, out, _ = self._run_cli("--config", str(self.profile), "deliveries")
+        self.assertIn("No deliveries waiting", out)
+
+    def test_dropbox_failure_uses_the_storage_fallback(self):
+        os.environ["FAKE_RCLONE_FAIL_COPY"] = "1"
+        backend = FakeBackend()
+        with mock.patch.object(deliver, "create_backend", return_value=backend):
+            code, out, err = self._run_cli("--config", str(self.profile),
+                                         "deliver", str(self.folder), "rev-10")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Storage INDEX", out)
+        self.assertIn("rev-10/INDEX.md", backend.objects)
+        # cleanup removes both the (partial) Dropbox copy path and the storage package.
+        os.environ.pop("FAKE_RCLONE_FAIL_COPY")
+        with mock.patch.object(deliver, "create_backend", return_value=backend):
+            code, out, err = self._run_cli("--config", str(self.profile),
+                                         "cleanup", "rev-10", "--drive-confirmed")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("rev-10/INDEX.md", backend.objects)
 
 
 if __name__ == "__main__":

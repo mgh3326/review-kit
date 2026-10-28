@@ -138,6 +138,48 @@ review-kit verify ./downloaded-package ./MANIFEST.json
 
 목록의 모든 파일의 크기와 SHA256을 비교하고, `MISSING`·`MISMATCH`·`EXTRA` 줄과 개수를 출력하며, 문제가 하나라도 있으면 0이 아닌 코드로 종료합니다. 폴더 안의 `INDEX.md`와 `MANIFEST.json`은 extra로 세지 않습니다. 프로필이나 네트워크가 필요 없습니다.
 
+### deliver: Drive 복사 → Dropbox → 스토리지 대체
+
+`deliver`는 검수자가 Drive → Dropbox → 스토리지 순서로 확인하는 경우의 수작업 절차를 한 명령으로 만든 것입니다.
+
+```bash
+review-kit --profile work deliver ./review-package pa-review-123
+```
+
+1. 패키지를 `DRIVE_MOUNT_DIR/<이름>/`에 복사합니다. Drive for desktop 마운트의 로컬 경로이거나 `host:/path` 같은 ssh 대상이 될 수 있습니다(각 파일을 `ssh`로 스트리밍하며 추가 도구가 필요 없습니다). 복사본은 `MANIFEST.json`의 바이트 크기와 SHA256으로 검증합니다. 매니페스트가 없으면 공유 manifest 코드로 생성해 복사본 옆에 둡니다.
+2. `DROPBOX_REMOTE/<이름>`에 `rclone copy`로 업로드하고 `rclone check`와 `rclone size`로 검증한 뒤 `rclone link`로 공유 링크를 만듭니다.
+3. Dropbox 단계가 실패한 경우에만 설정된 Supabase/S3 백엔드(`share upload`와 같은 서명 링크 방식)로 대체 업로드합니다.
+
+명령은 패키지 안에 작은 `DELIVERY.json`을 쓰고, Drive 경로·Dropbox 링크(또는 스토리지 INDEX 링크)·파일 수·바이트 합·매니페스트 SHA256이 담긴 Markdown 스니펫을 출력합니다. 검수 요청에 그대로 붙여 넣으면 됩니다. `DELIVERY.json`은 자동 생성 파일이므로 복사·계수 대상이 아닙니다.
+
+플래그: `--no-dropbox`는 Drive 마운트에만 복사하고, `--force-supabase`는 Dropbox를 건너뛰고 스토리지로 바로 업로드하며, `--dry-run`은 복사·업로드 없이 계획만 출력합니다. 기본 리모트는 없습니다. `deliver`에는 프로필의 `DRIVE_MOUNT_DIR`와 (플래그로 생략하지 않는 한) `DROPBOX_REMOTE`가 필요합니다.
+
+```ini
+DRIVE_MOUNT_DIR=/path/to/Drive-mount/reviews
+# 또는 ssh 대상: DRIVE_MOUNT_DIR=host:/path/to/drive/reviews
+DROPBOX_REMOTE=dropbox:Project/review
+# 선택: Drive 업로드가 클라우드에 보일 때 yes/no를 출력하는 명령
+DRIVE_CHECK_CMD=/path/to/drive-visible.sh
+```
+
+`rclone`과 `ssh`가 `PATH`에 있어야 하며 rclone에는 Dropbox 리모트가 설정되어 있어야 합니다. 전달 이름은 영문·숫자·점·밑줄·대시와 선택적 `/` 중첩을 허용합니다.
+
+Drive 마운트에 복사되면 Drive for desktop의 클라우드 업로드가 백그라운드에서 계속 진행 중이어도 전달된 것으로 간주합니다. 클라우드에 실제로 보이는지는 `drive-visible`이 플러그형 검사로 확인합니다. `DRIVE_CHECK_CMD`에 `yes` 또는 `no`를 출력하는 명령을 지정하세요(환경 변수 `REVIEW_KIT_DRIVE_NAME`과 `REVIEW_KIT_DRIVE_PATH`를 받습니다). 훅이 없으면 `unknown`입니다.
+
+```bash
+review-kit --profile work drive-visible pa-review-123   # yes, no 또는 unknown 출력
+```
+
+Drive에 보이게 되면 임시 Dropbox 복사본과 스토리지 패키지를 삭제합니다.
+
+```bash
+review-kit --profile work cleanup pa-review-123 --dry-run
+review-kit --profile work cleanup pa-review-123                     # 먼저 Drive 확인 실행
+review-kit --profile work cleanup pa-review-123 --drive-confirmed   # 직접 확인한 경우
+```
+
+`cleanup`은 검사 결과가 `no`나 `unknown`이면 `--drive-confirmed` 없이는 실행을 거부합니다. Dropbox 삭제는 보호되어 있습니다. `DROPBOX_REMOTE` 아래의 기록된 리모트 경로만 `rclone purge`로 지우고, 스토리지에서는 원장에 추적된 객체만(`done` 규칙) 삭제합니다. 모든 전달은 `~/.local/state/review-kit/deliveries.json`에 기록되며(`DELIVERIES_PATH`로 이동 가능), `review-kit deliveries`가 아직 정리를 기다리는 전달을 보여주고 `--all`은 전부를 보여줍니다.
+
 ## 빠른 시작
 
 ```bash
