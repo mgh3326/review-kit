@@ -21,6 +21,7 @@ from review_kit import board
 from review_kit import cli
 from review_kit import deliver
 from review_kit import miro
+from review_kit import verify
 from review_kit.backends import (S3Backend, _supabase_object_missing, create_backend,
                                  sigv4_presigned_url, sigv4_signature)
 from review_kit.config import load_config
@@ -636,6 +637,7 @@ class FakeTools:
         self.calls = []
         self.check_output = b""
         self.dropbox_fails = False
+        self.dropbox_full = False
         self.link = "https://dropbox.example.test/share-link"
 
     @staticmethod
@@ -689,7 +691,15 @@ class FakeTools:
                     local[relative] = path.read_bytes()
         return local
 
+    def _rclone_about(self, args):
+        return b"Total:   2 GiB\nUsed:    2 GiB\nFree:    0 B\n"
+
     def _rclone_copy(self, args):
+        if self.dropbox_full:
+            # The 200-char summary cuts the Dropbox error off; only stderr has it.
+            raise deliver.CommandError(
+                "rclone failed (exit 1); Failed to copy",
+                "Failed to copy: " + "x" * 300 + " path/insufficient_space/..")
         if self.dropbox_fails:
             raise RuntimeError("rclone failed (exit 1); simulated outage")
         dest = self._positionals(args[1:])[1]
@@ -829,6 +839,173 @@ class DeliverTests(unittest.TestCase):
         # rclone never reached the link step.
         self.assertFalse(any(call[0:2] == ["rclone", "link"]
                              for call in self.tools.calls if not isinstance(call, str)))
+
+    def test_foreign_manifest_is_kept_and_review_kit_manifest_goes_beside_it(self):
+        foreign = b'{"schema": "other-tool/2", "items": [1, 2]}\n'
+        (self.folder / "MANIFEST.json").write_bytes(foreign)
+        result = self._deliver()
+        info = result["delivery"]
+        self.assertEqual((info["manifest"], info["manifest_file"]),
+                         ("generated", "MANIFEST.review-kit.json"))
+        self.assertEqual((self.folder / "MANIFEST.json").read_bytes(), foreign)
+        self.assertFalse((self.folder / "MANIFEST.review-kit.json").exists())
+        copied = self.drive / "rev-1"
+        self.assertEqual((copied / "MANIFEST.json").read_bytes(), foreign)
+        sidecar = copied / "MANIFEST.review-kit.json"
+        listed = [entry["relative_path"] for entry in verify.load_manifest(sidecar)["files"]]
+        self.assertEqual(listed, ["MANIFEST.json", "README_review_request.md", "stills/a.png"])
+        self.assertEqual(info["files"], 3)
+        self.assertEqual(sorted(self.tools.dropbox["dropbox:Project/review/rev-1"]),
+                         ["MANIFEST.json", "MANIFEST.review-kit.json",
+                          "README_review_request.md", "stills/a.png"])
+        recorded = json.loads((self.folder / "DELIVERY.json").read_text(encoding="utf-8"))
+        self.assertEqual(recorded["manifest_file"], "MANIFEST.review-kit.json")
+        self.assertIn("(MANIFEST.review-kit.json)", result["markdown"])
+        # verify finds the review-kit manifest by itself and counts nothing extra.
+        self.assertEqual(verify.find_manifest(copied), sidecar)
+        checked = verify.verify_folder(copied, sidecar)
+        self.assertEqual((checked["ok"], checked["missing"], checked["mismatch"],
+                          checked["extra"]), (3, [], [], []))
+        # Re-delivering is stable, and a changed foreign file is caught by verification.
+        self.assertEqual(self._deliver()["delivery"]["manifest_file"],
+                         "MANIFEST.review-kit.json")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["verify", str(copied)]), 0)
+        self.assertIn("OK", out.getvalue())
+
+    def test_unparseable_manifest_json_is_foreign_too(self):
+        (self.folder / "MANIFEST.json").write_text("not json at all", encoding="utf-8")
+        result = self._deliver()
+        self.assertEqual(result["delivery"]["manifest_file"], "MANIFEST.review-kit.json")
+        self.assertEqual((self.drive / "rev-1" / "MANIFEST.json").read_text(encoding="utf-8"),
+                         "not json at all")
+
+    def test_foreign_manifest_over_ssh_and_dry_run_plan(self):
+        (self.folder / "MANIFEST.json").write_text('{"schema": "x/1"}', encoding="utf-8")
+        config = dict(self.config, DRIVE_MOUNT_DIR="mbp:/Volumes/Drive")
+        plan = deliver.deliver_package(config, self.folder, "ssh-f", run=self.tools,
+                                       dry_run=True)["plan"]
+        self.assertTrue(any("MANIFEST.review-kit.json" in line for line in plan))
+        deliver.deliver_package(config, self.folder, "ssh-f", run=self.tools)
+        remote = self.tools.remote_fs["/Volumes/Drive/ssh-f"]
+        self.assertEqual(remote["MANIFEST.json"], b'{"schema": "x/1"}')
+        self.assertIn("MANIFEST.review-kit.json", remote)
+
+    def test_existing_review_kit_manifest_beside_a_foreign_one_is_reused(self):
+        self._deliver()
+        generated = (self.drive / "rev-1" / "MANIFEST.json").read_bytes()
+        (self.folder / "MANIFEST.json").write_text('{"schema": "x/1"}', encoding="utf-8")
+        (self.folder / "MANIFEST.review-kit.json").write_bytes(generated)
+        # The foreign MANIFEST.json is generated-name territory, not "extra", so the
+        # supplied sidecar is used as is.
+        second = self._deliver("rev-2")
+        self.assertEqual(second["delivery"]["manifest"], "existing")
+        self.assertEqual(second["delivery"]["manifest_file"], "MANIFEST.review-kit.json")
+
+    def test_foreign_sidecar_name_is_never_overwritten(self):
+        (self.folder / "MANIFEST.json").write_text('{"schema": "x/1"}', encoding="utf-8")
+        (self.folder / "MANIFEST.review-kit.json").write_text("mine", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "refusing to overwrite"):
+            self._deliver()
+
+    def _record_old_deliveries(self):
+        """Three finished deliveries: Drive-confirmed, unconfirmed and already cleaned."""
+        for name in ("old-ok", "old-unconfirmed", "old-cleaned"):
+            self._deliver(name)
+        deliver.cleanup_package(self.config, "old-cleaned", drive_confirmed=True,
+                                run=self.tools)
+        state = deliver.load_deliveries(self.state)
+        state["deliveries"]["old-ok"]["drive_visible"] = "yes"
+        deliver.save_deliveries(self.state, state)
+
+    def test_dropbox_full_reports_usage_and_candidates_then_falls_back_when_it_fits(self):
+        self._record_old_deliveries()
+        self.tools.dropbox_full = True
+        result = self._deliver("rev-new")
+        delivery = result["delivery"]
+        self.assertTrue(delivery["dropbox"]["insufficient_space"])
+        self.assertIn("index_url", delivery["storage"])
+        notice = "\n".join(result["notices"])
+        self.assertIn("insufficient_space", notice)
+        self.assertIn("rclone about dropbox:", notice)
+        self.assertIn("Free:    0 B", notice)
+        self.assertIn("old-ok", notice)
+        self.assertIn("review-kit cleanup old-ok", notice)
+        self.assertNotIn("old-unconfirmed", notice)
+        self.assertNotIn("old-cleaned", notice)
+        # Candidates are only listed, never deleted.
+        self.assertIn("dropbox:Project/review/old-ok", self.tools.dropbox)
+        self.assertFalse(deliver.load_deliveries(self.state)["deliveries"]["old-ok"]["cleaned"])
+        about = [call for call in self.tools.calls
+                 if not isinstance(call, str) and call[:2] == ["rclone", "about"]]
+        self.assertEqual(about, [["rclone", "about", "dropbox:"]])
+
+    def test_dropbox_full_stops_without_fallback_when_the_package_is_too_big(self):
+        self._record_old_deliveries()
+        self.tools.dropbox_full = True
+        self.config["STORAGE_MAX_OBJECT_MB"] = "0.000005"  # 5 bytes; stills/a.png is 9
+        with self.assertRaises(deliver.DeliverStopped) as caught:
+            self._deliver("rev-big")
+        message = str(caught.exception)
+        for expected in ("insufficient_space", "rclone about dropbox:", "old-ok",
+                         "stills/a.png", "STORAGE_MAX_OBJECT_MB", "Drive copy"):
+            self.assertIn(expected, message)
+        self.assertEqual(self.backend.objects, {})
+        self.assertNotIn("rev-big", deliver.load_deliveries(self.state)["deliveries"])
+        self.assertTrue((self.drive / "rev-big" / "stills" / "a.png").is_file())
+        recorded = json.loads((self.folder / "DELIVERY.json").read_text(encoding="utf-8"))
+        self.assertNotEqual(recorded["name"], "rev-big")
+        self.assertIn("dropbox:Project/review/old-ok", self.tools.dropbox)
+
+    def test_any_dropbox_failure_respects_the_storage_limit(self):
+        self.tools.dropbox_fails = True
+        self.config["STORAGE_MAX_OBJECT_MB"] = "0.000005"
+        with self.assertRaisesRegex(deliver.DeliverStopped, "(?s)Dropbox step failed.*per-object"):
+            self._deliver()
+        self.assertEqual(self.backend.objects, {})
+
+    def test_force_supabase_checks_the_limit_before_copying_anything(self):
+        self.config["STORAGE_MAX_OBJECT_MB"] = "0.000005"
+        with self.assertRaisesRegex(ValueError, "per-object limit"):
+            self._deliver("forced", force_supabase=True)
+        self.assertFalse((self.drive / "forced").exists())
+        plan = self._deliver("forced", force_supabase=True, dry_run=True)["plan"]
+        self.assertTrue(any(line.strip().startswith("WARNING") for line in plan))
+
+    def test_storage_limit_profile_key(self):
+        self.assertEqual(deliver.storage_limit_bytes({}), 50_000_000)
+        self.assertEqual(deliver.storage_limit_bytes({"STORAGE_MAX_OBJECT_MB": "12.5"}),
+                         12_500_000)
+        for bad in ("abc", "0", "-3", "inf"):
+            with self.assertRaises(ValueError, msg=bad):
+                deliver.storage_limit_bytes({"STORAGE_MAX_OBJECT_MB": bad})
+
+    def test_cleanup_candidates_recheck_drive_and_record_the_answer(self):
+        self._deliver("rev-a")
+        self._deliver("rev-b", no_dropbox=True)  # nothing on Dropbox to free
+        config = dict(self.config, DRIVE_CHECK_CMD="check-command")
+        self.tools.check_output = b"no\n"
+        self.assertEqual(deliver.cleanup_candidates(config, run=self.tools), [])
+        self.tools.check_output = b"yes\n"
+        rows = deliver.cleanup_candidates(config, run=self.tools)
+        self.assertEqual([name for name, _ in rows], ["rev-a"])
+        state = deliver.load_deliveries(self.state)["deliveries"]
+        self.assertEqual(state["rev-a"]["drive_visible"], "yes")
+        self.assertFalse(state["rev-a"]["cleaned"])
+
+    def test_cli_cleanup_candidates_lists_without_deleting(self):
+        self._record_old_deliveries()
+        profile = self.root / "x.env"
+        profile.write_text("DELIVERIES_PATH=%s\n" % self.state, encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(["--config", str(profile), "deliveries", "--cleanup-candidates"])
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("old-ok", text)
+        self.assertNotIn("old-unconfirmed", text)
+        self.assertIn("dropbox:Project/review/old-ok", self.tools.dropbox)
 
     def test_no_dropbox_and_force_supabase_modes(self):
         result = self._deliver("only-drive", no_dropbox=True)
@@ -1047,7 +1224,12 @@ def local_files(source, skip):
 
 args = sys.argv[1:]
 command = args[0]
-if command == "copy":
+if command == "about":
+    print("Total:   2 GiB\\nUsed:    2 GiB\\nFree:    0 B")
+elif command == "copy":
+    if os.environ.get("FAKE_RCLONE_FULL"):
+        sys.stderr.write("Failed to copy: " + "x" * 300 + " path/insufficient_space/..\\n")
+        sys.exit(1)
     if os.environ.get("FAKE_RCLONE_FAIL_COPY"):
         sys.exit(1)
     source, dest = positionals(args[1:])
@@ -1168,6 +1350,56 @@ class DeliverShimTests(unittest.TestCase):
                                          "cleanup", "rev-10", "--drive-confirmed")
         self.assertEqual(code, 0, err)
         self.assertNotIn("rev-10/INDEX.md", backend.objects)
+
+    def _deliver_cli(self, name, backend=None):
+        backend = backend or FakeBackend()
+        with mock.patch.object(deliver, "create_backend", return_value=backend):
+            return self._run_cli("--config", str(self.profile), "deliver",
+                                 str(self.folder), name)
+
+    def test_foreign_manifest_package_over_ssh_and_rclone(self):
+        foreign = b'{"schema": "other-tool/2"}\n'
+        (self.folder / "MANIFEST.json").write_bytes(foreign)
+        code, out, err = self._deliver_cli("rev-11")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((self.folder / "MANIFEST.json").read_bytes(), foreign)
+        remote = self.fake_ssh / "remote" / "drive" / "rev-11"
+        dropbox_copy = self.fake_rclone / "Project" / "review" / "rev-11"
+        for target in (remote, dropbox_copy):
+            self.assertEqual((target / "MANIFEST.json").read_bytes(), foreign)
+            self.assertTrue((target / "MANIFEST.review-kit.json").is_file())
+        self.assertIn("(MANIFEST.review-kit.json)", out)
+        code, out, err = self._run_cli("verify", str(dropbox_copy))
+        self.assertEqual(code, 0, err)
+
+    def test_dropbox_full_via_rclone_stderr_falls_back_when_it_fits(self):
+        code, _, err = self._deliver_cli("old-1")
+        self.assertEqual(code, 0, err)
+        os.environ["FAKE_RCLONE_FULL"] = "1"
+        backend = FakeBackend()
+        code, out, err = self._deliver_cli("rev-12", backend)
+        self.assertEqual(code, 0, err)
+        self.assertIn("path/insufficient_space", err)
+        self.assertIn("Free:    0 B", err)
+        self.assertIn("review-kit cleanup old-1", err)  # DRIVE_CHECK_CMD prints yes
+        self.assertIn("rev-12/INDEX.md", backend.objects)
+        self.assertTrue((self.fake_rclone / "Project" / "review" / "old-1").is_dir())
+
+    def test_dropbox_full_stops_when_the_package_exceeds_the_storage_limit(self):
+        self.profile.write_text(self.profile.read_text(encoding="utf-8") +
+                                "STORAGE_MAX_OBJECT_MB=0.000001\n", encoding="utf-8")
+        os.environ["FAKE_RCLONE_FULL"] = "1"
+        backend = FakeBackend()
+        code, out, err = self._deliver_cli("rev-13", backend)
+        self.assertEqual(code, 1)
+        self.assertIn("insufficient_space", err)
+        self.assertIn("rclone about fakedb:", err)
+        self.assertIn("per-object limit", err)
+        self.assertEqual(backend.objects, {})
+        self.assertEqual(out, "")
+        self.assertTrue((self.fake_ssh / "remote" / "drive" / "rev-13").is_dir())
+        code, out, _ = self._run_cli("--config", str(self.profile), "deliveries")
+        self.assertIn("No deliveries waiting", out)
 
 
 PNG_BYTES = (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" +

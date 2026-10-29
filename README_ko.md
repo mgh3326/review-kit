@@ -134,9 +134,10 @@ review-kit done pa-review-123           # 검수 종료 후 명시적으로 삭�
 
 ```bash
 review-kit verify ./downloaded-package ./MANIFEST.json
+review-kit verify ./downloaded-package        # MANIFEST.json, 없으면 MANIFEST.review-kit.json을 자동 탐색
 ```
 
-목록의 모든 파일의 크기와 SHA256을 비교하고, `MISSING`·`MISMATCH`·`EXTRA` 줄과 개수를 출력하며, 문제가 하나라도 있으면 0이 아닌 코드로 종료합니다. 폴더 안의 `INDEX.md`와 `MANIFEST.json`은 extra로 세지 않습니다. 프로필이나 네트워크가 필요 없습니다.
+목록의 모든 파일의 크기와 SHA256을 비교하고, `MISSING`·`MISMATCH`·`EXTRA` 줄과 개수를 출력하며, 문제가 하나라도 있으면 0이 아닌 코드로 종료합니다. 폴더 안의 `INDEX.md`, `MANIFEST.json`, `MANIFEST.review-kit.json`은 extra로 세지 않습니다. 프로필이나 네트워크가 필요 없습니다.
 
 ### deliver: Drive 복사 → Dropbox → 스토리지 대체
 
@@ -146,9 +147,9 @@ review-kit verify ./downloaded-package ./MANIFEST.json
 review-kit --profile work deliver ./review-package pa-review-123
 ```
 
-1. 패키지를 `DRIVE_MOUNT_DIR/<이름>/`에 복사합니다. Drive for desktop 마운트의 로컬 경로이거나 `host:/path` 같은 ssh 대상이 될 수 있습니다(각 파일을 `ssh`로 스트리밍하며 추가 도구가 필요 없습니다). 복사본은 `MANIFEST.json`의 바이트 크기와 SHA256으로 검증합니다. 매니페스트가 없으면 공유 manifest 코드로 생성해 복사본 옆에 둡니다.
+1. 패키지를 `DRIVE_MOUNT_DIR/<이름>/`에 복사합니다. Drive for desktop 마운트의 로컬 경로이거나 `host:/path` 같은 ssh 대상이 될 수 있습니다(각 파일을 `ssh`로 스트리밍하며 추가 도구가 필요 없습니다). 복사본은 `MANIFEST.json`의 바이트 크기와 SHA256으로 검증합니다. 매니페스트가 없으면 공유 manifest 코드로 생성해 복사본 옆에 둡니다. 패키지에 이미 다른 스키마의 자체 `MANIFEST.json`이 있으면 그 파일은 건드리지 않고(일반 파일로 목록에 포함됩니다), review-kit 매니페스트를 `MANIFEST.review-kit.json`으로 옆에 쓰고 검증에 사용하며 `DELIVERY.json`의 `manifest_file`에 기록합니다.
 2. `DROPBOX_REMOTE/<이름>`에 `rclone copy`로 업로드하고 `rclone check`와 `rclone size`로 검증한 뒤 `rclone link`로 공유 링크를 만듭니다.
-3. Dropbox 단계가 실패한 경우에만 설정된 Supabase/S3 백엔드(`share upload`와 같은 서명 링크 방식)로 대체 업로드합니다.
+3. Dropbox 단계가 실패한 경우에만 설정된 Supabase/S3 백엔드(`share upload`와 같은 서명 링크 방식)로 대체 업로드하며, 모든 파일이 스토리지 한도(`STORAGE_MAX_OBJECT_MB`, 기본 객체당 `50` 십진 MB) 이내일 때만 그렇게 합니다. 한도를 넘으면 이유를 알리고 중단합니다. 검증된 Drive 복사본은 그대로 남고 전달 기록은 쓰지 않습니다. 외부 `MANIFEST.json`은 스토리지가 자체 매니페스트를 만들기 때문에 스토리지에는 올라가지 않습니다.
 
 명령은 패키지 안에 작은 `DELIVERY.json`을 쓰고, Drive 경로·Dropbox 링크(또는 스토리지 INDEX 링크)·파일 수·바이트 합·매니페스트 SHA256이 담긴 Markdown 스니펫을 출력합니다. 검수 요청에 그대로 붙여 넣으면 됩니다. `DELIVERY.json`은 자동 생성 파일이므로 복사·계수 대상이 아닙니다.
 
@@ -160,6 +161,8 @@ DRIVE_MOUNT_DIR=/path/to/Drive-mount/reviews
 DROPBOX_REMOTE=dropbox:Project/review
 # 선택: Drive 업로드가 클라우드에 보일 때 yes/no를 출력하는 명령
 DRIVE_CHECK_CMD=/path/to/drive-visible.sh
+# 선택: 스토리지 대체 업로드가 허용하는 단일 객체 최대 크기(기본 50)
+STORAGE_MAX_OBJECT_MB=50
 ```
 
 `rclone`과 `ssh`가 `PATH`에 있어야 하며 rclone에는 Dropbox 리모트가 설정되어 있어야 합니다. 전달 이름은 영문·숫자·점·밑줄·대시와 선택적 `/` 중첩을 허용합니다.
@@ -176,6 +179,13 @@ Drive에 보이게 되면 임시 Dropbox 복사본과 스토리지 패키지를 
 review-kit --profile work cleanup pa-review-123 --dry-run
 review-kit --profile work cleanup pa-review-123                     # 먼저 Drive 확인 실행
 review-kit --profile work cleanup pa-review-123 --drive-confirmed   # 직접 확인한 경우
+```
+
+**Dropbox 용량 부족.** `rclone`이 `path/insufficient_space`를 보고하면 `deliver`는 일반 실패로 넘기지 않고 이를 명시합니다. `rclone about <리모트>:` 사용량과 정리 후보(Dropbox에 남아 있고 Drive 복사본이 보이는 것으로 확인된 전달)를 출력합니다. 아직 확인되지 않은 항목은 `DRIVE_CHECK_CMD`로 물어보고 그 답을 `deliveries.json`에 기록합니다. 자동으로 삭제하는 것은 없습니다. 패키지가 `STORAGE_MAX_OBJECT_MB` 이내면 스토리지 대체 업로드는 그대로 진행하고, 넘으면 이 보고와 함께 0이 아닌 코드로 종료합니다. 같은 후보는 언제든 조회할 수 있으며, 공간은 `cleanup`으로 직접 확보합니다.
+
+```bash
+review-kit --profile work deliveries --cleanup-candidates
+review-kit --profile work cleanup <이름>
 ```
 
 `cleanup`은 검사 결과가 `no`나 `unknown`이면 `--drive-confirmed` 없이는 실행을 거부합니다. Dropbox 삭제는 보호되어 있습니다. `DROPBOX_REMOTE` 아래의 기록된 리모트 경로만 `rclone purge`로 지우고, 스토리지에서는 원장에 추적된 객체만(`done` 규칙) 삭제합니다. 모든 전달은 `~/.local/state/review-kit/deliveries.json`에 기록되며(`DELIVERIES_PATH`로 이동 가능), `review-kit deliveries`가 아직 정리를 기다리는 전달을 보여주고 `--all`은 전부를 보여줍니다.

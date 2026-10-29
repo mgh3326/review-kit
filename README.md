@@ -159,9 +159,10 @@ After downloading the files into a folder, the reviewer checks them with:
 
 ```bash
 review-kit verify ./downloaded-package ./MANIFEST.json
+review-kit verify ./downloaded-package        # finds MANIFEST.json, else MANIFEST.review-kit.json
 ```
 
-It compares the size and SHA256 of every listed file, prints `MISSING`, `MISMATCH` and `EXTRA` lines plus their counts, and exits non-zero on any problem. `INDEX.md` and `MANIFEST.json` in the folder are not counted as extra. It needs no profile or network.
+It compares the size and SHA256 of every listed file, prints `MISSING`, `MISMATCH` and `EXTRA` lines plus their counts, and exits non-zero on any problem. `INDEX.md`, `MANIFEST.json` and `MANIFEST.review-kit.json` in the folder are not counted as extra. It needs no profile or network.
 
 Upload refuses to overwrite any existing storage key unless its recorded SHA256 matches. Use a fresh prefix for each package; run `done` to remove an active package before reusing its prefix.
 
@@ -173,9 +174,9 @@ Upload refuses to overwrite any existing storage key unless its recorded SHA256 
 review-kit --profile work deliver ./review-package pa-review-123
 ```
 
-1. The package is copied into `DRIVE_MOUNT_DIR/<name>/`, a local path to a Drive-for-desktop mount or an ssh target such as `host:/path` (each file is streamed over `ssh`, no extra tooling). The copy is verified against `MANIFEST.json` by byte size and SHA256. When the package has no manifest, one is generated with the shared manifest code and written next to the copy.
+1. The package is copied into `DRIVE_MOUNT_DIR/<name>/`, a local path to a Drive-for-desktop mount or an ssh target such as `host:/path` (each file is streamed over `ssh`, no extra tooling). The copy is verified against `MANIFEST.json` by byte size and SHA256. When the package has no manifest, one is generated with the shared manifest code and written next to the copy. A package that already carries its own `MANIFEST.json` in another schema keeps it untouched (it is listed as an ordinary file); review-kit's manifest is written beside it as `MANIFEST.review-kit.json`, used for verification, and named in `DELIVERY.json` (`manifest_file`).
 2. The package is uploaded to `DROPBOX_REMOTE/<name>` with `rclone copy`, verified with `rclone check` and `rclone size`, and shared with `rclone link`.
-3. Only when the Dropbox step fails does `deliver` fall back to the configured Supabase/S3 backend — the same machinery as `share upload`, with signed links.
+3. Only when the Dropbox step fails does `deliver` fall back to the configured Supabase/S3 backend — the same machinery as `share upload`, with signed links — and only when every file is within the storage limit (`STORAGE_MAX_OBJECT_MB`, default `50` decimal MB per object). Otherwise `deliver` stops with the reason; the verified Drive copy stays in place and no delivery is recorded. A foreign `MANIFEST.json` is not uploaded to storage, which generates its own.
 
 The command writes a small `DELIVERY.json` into the package and prints a Markdown snippet with the Drive path, the Dropbox link (or the storage INDEX link), the file count, byte total and manifest SHA256 — paste it into the review request. `DELIVERY.json` is generated and is never copied or counted.
 
@@ -187,6 +188,8 @@ DRIVE_MOUNT_DIR=/path/to/Drive-mount/reviews
 DROPBOX_REMOTE=dropbox:Project/review
 # optional: a command that prints yes/no once the Drive upload is visible in the cloud
 DRIVE_CHECK_CMD=/path/to/drive-visible.sh
+# optional: largest single object the storage fallback may upload (default 50)
+STORAGE_MAX_OBJECT_MB=50
 ```
 
 `rclone` and `ssh` must be on `PATH`; rclone needs its own configured Dropbox remote. Delivery names allow letters, digits, dot, underscore, dash and optional `/` nesting.
@@ -203,6 +206,13 @@ Once Drive is visible, delete the temporary Dropbox copy and any storage package
 review-kit --profile work cleanup pa-review-123 --dry-run
 review-kit --profile work cleanup pa-review-123                     # runs the Drive check first
 review-kit --profile work cleanup pa-review-123 --drive-confirmed   # already confirmed by hand
+```
+
+**Dropbox full.** When `rclone` reports `path/insufficient_space`, `deliver` says so explicitly instead of treating it as a generic failure: it prints the `rclone about <remote>:` usage and the cleanup candidates — deliveries still on Dropbox whose Drive copy is confirmed visible (it asks `DRIVE_CHECK_CMD` for entries not yet confirmed and records the answer in `deliveries.json`). Nothing is deleted automatically. If the package fits `STORAGE_MAX_OBJECT_MB`, the storage fallback still runs; if not, `deliver` exits non-zero with that report. List the same candidates any time, then free space yourself with `cleanup`:
+
+```bash
+review-kit --profile work deliveries --cleanup-candidates
+review-kit --profile work cleanup <name>
 ```
 
 `cleanup` refuses to run while the check says `no` or `unknown` unless `--drive-confirmed` is passed. The Dropbox deletion is guarded: only the recorded remote path under `DROPBOX_REMOTE` is purged (`rclone purge`), and only ledger-tracked objects are removed from storage (the `done` rules). Every delivery is recorded in `~/.local/state/review-kit/deliveries.json` (set `DELIVERIES_PATH` to move it); `review-kit deliveries` lists the ones still waiting for cleanup and `--all` shows everything.
