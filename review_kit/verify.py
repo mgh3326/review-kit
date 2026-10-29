@@ -5,8 +5,10 @@ from pathlib import Path
 
 from .share import MANIFEST_NAME, MANIFEST_SCHEMA, sha256_file
 
+# review-kit's manifest when the package already ships its own, foreign MANIFEST.json.
+SIDECAR_MANIFEST_NAME = "MANIFEST.review-kit.json"
 # Generated listing files a reviewer downloads next to the package; never "extra".
-GENERATED_NAMES = ("INDEX.md", MANIFEST_NAME)
+GENERATED_NAMES = ("INDEX.md", MANIFEST_NAME, SIDECAR_MANIFEST_NAME)
 
 
 def load_manifest(path):
@@ -28,6 +30,24 @@ def load_manifest(path):
                 or not isinstance(entry.get("sha256"), str)):
             raise ValueError("Manifest entries need integer bytes and a sha256 string")
     return manifest
+
+
+def is_review_kit_manifest(path):
+    """True for JSON in the review-kit manifest schema; any other file is foreign."""
+    try:
+        data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("schema") == MANIFEST_SCHEMA
+
+
+def find_manifest(folder):
+    """The folder's review-kit manifest: MANIFEST.json, else the sidecar beside a foreign one."""
+    for name in (MANIFEST_NAME, SIDECAR_MANIFEST_NAME):
+        path = Path(folder).expanduser() / name
+        if path.is_file() and is_review_kit_manifest(path):
+            return path
+    return None
 
 
 def _present_files(folder):

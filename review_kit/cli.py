@@ -9,12 +9,12 @@ from .backends import create_backend
 from .board import (COMMENTS_UNAVAILABLE, inventory_board,
                     inventory_markdown, place_board)
 from .config import load_config
-from .deliver import (cleanup_package, deliver_package, deliveries_path,
-                      drive_visible, load_deliveries)
+from .deliver import (candidate_line, cleanup_candidates, cleanup_package,
+                      deliver_package, deliveries_path, drive_visible, load_deliveries)
 from .miro import MiroClient
 from .share import (DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES, done_package,
                     package_status, prune_packages, resign_package, upload_folder)
-from .verify import verify_folder
+from .verify import find_manifest, verify_folder
 
 
 def _load_drive_manifest(path):
@@ -57,7 +57,8 @@ def _parser():
 
     verify = commands.add_parser("verify", help="check a downloaded folder against MANIFEST.json")
     verify.add_argument("directory", type=Path)
-    verify.add_argument("manifest", type=Path)
+    verify.add_argument("manifest", type=Path, nargs="?",
+                        help="default: MANIFEST.json, else MANIFEST.review-kit.json in the folder")
 
     done = commands.add_parser("done", help="delete a tracked package after review")
     done.add_argument("prefix")
@@ -98,8 +99,12 @@ def _parser():
 
     deliveries = commands.add_parser(
         "deliveries", help="list deliveries still waiting for cleanup")
-    deliveries.add_argument("--all", action="store_true",
-                            help="include deliveries already cleaned up")
+    listing_mode = deliveries.add_mutually_exclusive_group()
+    listing_mode.add_argument("--all", action="store_true",
+                              help="include deliveries already cleaned up")
+    listing_mode.add_argument("--cleanup-candidates", action="store_true",
+                              help="only deliveries on Dropbox that are Drive-confirmed "
+                                   "(safe to clean up); nothing is deleted")
 
     board = commands.add_parser(
         "board", help="lay out review captures on a Miro board")
@@ -164,6 +169,16 @@ def _run_package(args):
     print("Package ready: %s" % output)
 
 
+def _run_cleanup_candidates(config):
+    rows = cleanup_candidates(config)
+    if not rows:
+        print("No cleanup candidates (none delivered to Dropbox with Drive confirmed)")
+        return
+    for name, entry in rows:
+        print(candidate_line(name, entry))
+    print("Nothing was deleted; remove one with: review-kit cleanup <name>")
+
+
 def _run_deliveries(config, show_all):
     state = load_deliveries(deliveries_path(config))
     rows = [(name, entry) for name, entry in sorted(state["deliveries"].items())
@@ -195,6 +210,8 @@ def _run_deliver(config, args):
     if dropbox.get("error"):
         print("Dropbox step failed; used the storage fallback instead.",
               file=sys.stderr)
+    for line in result["notices"]:
+        print(line, file=sys.stderr)
     print(result["markdown"], end="")
     print("Wrote %s" % result["delivery_path"])
 
@@ -224,6 +241,8 @@ def _run_delivery_command(args):
     config = load_config(args.profile, args.config)
     if args.command == "drive-visible":
         print(drive_visible(config, args.name))
+    elif args.command == "deliveries" and args.cleanup_candidates:
+        _run_cleanup_candidates(config)
     elif args.command == "deliveries":
         _run_deliveries(config, args.all)
     elif args.command == "deliver":
@@ -268,7 +287,11 @@ def _run_board_command(args):
 
 
 def _run_verify(args):
-    result = verify_folder(args.directory, args.manifest)
+    manifest = args.manifest or find_manifest(args.directory)
+    if not manifest:
+        raise ValueError("No review-kit manifest in the folder "
+                         "(looked for MANIFEST.json and MANIFEST.review-kit.json)")
+    result = verify_folder(args.directory, manifest)
     for label, names in (("MISSING", result["missing"]), ("MISMATCH", result["mismatch"]),
                          ("EXTRA", result["extra"])):
         for name in names:

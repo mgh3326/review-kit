@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+from collections import namedtuple
 from pathlib import Path
 import re
 import shlex
@@ -13,14 +14,31 @@ from .backends import create_backend
 from .share import (MANIFEST_NAME, _markdown_url, build_manifest, done_package,
                     load_ledger, safe_key, save_ledger, sha256_file, upload_folder,
                     utc_now)
-from .verify import GENERATED_NAMES, load_manifest, verify_folder
+from .verify import (GENERATED_NAMES, SIDECAR_MANIFEST_NAME, find_manifest,
+                     load_manifest, verify_folder)
 
 
 DELIVERY_SCHEMA = "review-kit-delivery/1"
 DELIVERY_NAME = "DELIVERY.json"
 NAME_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 SSH_TARGET = re.compile(r"^((?:[A-Za-z0-9_.-]+@)?[A-Za-z0-9_.-]{2,}):(.+)$")
-GENERATED_ROOT_NAMES = frozenset(GENERATED_NAMES)  # INDEX.md, MANIFEST.json
+GENERATED_ROOT_NAMES = frozenset(GENERATED_NAMES)  # INDEX.md, MANIFEST*.json
+DEFAULT_STORAGE_MAX_OBJECT_MB = 50.0
+
+# The package's manifest: parsed dict, file bytes, "existing" or "generated", file name.
+PackageManifest = namedtuple("PackageManifest", "manifest data source name")
+
+
+class CommandError(RuntimeError):
+    """A failed external command; keeps the full stderr for error classification."""
+
+    def __init__(self, message, stderr=""):
+        RuntimeError.__init__(self, message)
+        self.stderr = stderr
+
+
+class DeliverStopped(RuntimeError):
+    """Delivery cannot continue; the message tells the operator what to do."""
 
 
 def validate_name(name):
@@ -58,7 +76,8 @@ def _default_run(argv, stdin=None, env=None):
     if result.returncode:
         stderr = result.stderr.decode("utf-8", "replace").strip()
         detail = ("; " + stderr[:200]) if stderr else ""
-        raise RuntimeError("%s failed (exit %d)%s" % (argv[0], result.returncode, detail))
+        raise CommandError("%s failed (exit %d)%s" % (argv[0], result.returncode, detail),
+                           stderr)
     return result.stdout
 
 
@@ -99,27 +118,42 @@ def _walk_package_files(folder):
 
 
 def _local_manifest(files, name, now):
-    """Build MANIFEST.json bytes for a local folder using the shared manifest schema."""
+    """Build manifest bytes for a local folder using the shared manifest schema.
+
+    A foreign MANIFEST.json is package content, so it is listed like any other file.
+    """
+    skipped = ("INDEX.md", SIDECAR_MANIFEST_NAME)
     rows = [{"file": relative, "size": path.stat().st_size, "sha256": sha256_file(path),
              "source": "local", "url": ""}
-            for relative, path in files if relative not in GENERATED_ROOT_NAMES]
+            for relative, path in files if relative not in skipped]
     return build_manifest(safe_key(name), "1", None, now, now, rows)
 
 
 def _resolve_manifest(directory, files, name, now):
-    """(manifest dict, manifest bytes, source) for the package."""
-    manifest_path = directory / MANIFEST_NAME
-    if manifest_path.is_file():
-        return load_manifest(manifest_path), manifest_path.read_bytes(), "existing"
+    """The package's PackageManifest.
+
+    A package's own MANIFEST.json in another schema stays untouched; review-kit's
+    manifest goes beside it as MANIFEST.review-kit.json.
+    """
+    found = find_manifest(directory)
+    if found:
+        return PackageManifest(load_manifest(found), found.read_bytes(), "existing",
+                               found.name)
+    foreign = (directory / MANIFEST_NAME).is_file()
+    manifest_name = SIDECAR_MANIFEST_NAME if foreign else MANIFEST_NAME
+    if foreign and (directory / manifest_name).exists():
+        raise ValueError("%s exists but is not a review-kit manifest; "
+                         "refusing to overwrite it" % manifest_name)
     data = _local_manifest(files, name, now)
-    return json.loads(data.decode("utf-8")), data, "generated"
+    return PackageManifest(json.loads(data.decode("utf-8")), data, "generated",
+                           manifest_name)
 
 
-def _copy_drive_ssh(run, host, dest, files, manifest_data, manifest_source):
+def _copy_drive_ssh(run, host, dest, files, package_manifest):
     run(["ssh", host, "mkdir -p -- " + _remote_quote(dest)])
     payload = [(relative, path.read_bytes()) for relative, path in files]
-    if manifest_source == "generated":
-        payload.append((MANIFEST_NAME, manifest_data))
+    if package_manifest.source == "generated":
+        payload.append((package_manifest.name, package_manifest.data))
     for relative, data in payload:
         parent = relative.rpartition("/")[0] or "."
         command = "cd %s && mkdir -p -- %s && cat > ./%s" % (
@@ -150,25 +184,24 @@ def _verify_drive_ssh(run, host, dest, manifest):
                            % (len(missing), len(mismatch), len(extra)))
 
 
-def _copy_and_verify_drive(run, mount, name, directory, files, manifest,
-                           manifest_data, manifest_source):
+def _copy_and_verify_drive(run, mount, name, directory, files, package_manifest):
     """Copy the package into DRIVE_MOUNT_DIR/<name>/ and verify it."""
     ssh_target = _split_ssh_target(mount)
     if ssh_target:
         host, root = ssh_target
         dest = root.rstrip("/") + "/" + name
-        _copy_drive_ssh(run, host, dest, files, manifest_data, manifest_source)
-        _verify_drive_ssh(run, host, dest, manifest)
+        _copy_drive_ssh(run, host, dest, files, package_manifest)
+        _verify_drive_ssh(run, host, dest, package_manifest.manifest)
         return
     dest = Path(mount).expanduser() / name
     dest.mkdir(parents=True, exist_ok=True)
     shutil.copytree(str(directory), str(dest), dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns(DELIVERY_NAME))
-    if manifest_source == "generated":
-        (dest / MANIFEST_NAME).write_bytes(manifest_data)
-        verify_manifest = dest / MANIFEST_NAME
+    if package_manifest.source == "generated":
+        (dest / package_manifest.name).write_bytes(package_manifest.data)
+        verify_manifest = dest / package_manifest.name
     else:
-        verify_manifest = directory / MANIFEST_NAME
+        verify_manifest = directory / package_manifest.name
     result = verify_folder(dest, verify_manifest)
     problems = (len(result["missing"]) + len(result["mismatch"]) +
                 len(result["extra"]))
@@ -194,24 +227,26 @@ def dropbox_destination(remote, name):
     return dest
 
 
-def _upload_dropbox(run, directory, files, remote_dest, manifest_data, manifest_source):
+def _upload_dropbox(run, directory, files, remote_dest, package_manifest):
     """rclone copy/check/size/link. Returns the share link or raises."""
     exclude = "/" + DELIVERY_NAME
+    generated = package_manifest.source == "generated"
     run(["rclone", "copy", str(directory), remote_dest, "--exclude", exclude])
-    if manifest_source == "generated":
+    if generated:
         temporary = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
         try:
-            temporary.write(manifest_data)
+            temporary.write(package_manifest.data)
             temporary.close()
-            run(["rclone", "copyto", temporary.name, remote_dest + "/" + MANIFEST_NAME])
+            run(["rclone", "copyto", temporary.name,
+                 remote_dest + "/" + package_manifest.name])
         finally:
             os.unlink(temporary.name)
     run(["rclone", "check", "--one-way", str(directory), remote_dest,
          "--exclude", exclude])
     size = json.loads(run(["rclone", "size", "--json", remote_dest]).decode("utf-8"))
-    expected_count = len(files) + (1 if manifest_source == "generated" else 0)
+    expected_count = len(files) + (1 if generated else 0)
     expected_bytes = (sum(path.stat().st_size for _, path in files) +
-                      (len(manifest_data) if manifest_source == "generated" else 0))
+                      (len(package_manifest.data) if generated else 0))
     if int(size.get("count", -1)) != expected_count or int(size.get("bytes", -1)) != expected_bytes:
         raise RuntimeError("Dropbox copy failed verification (remote has %s files, %s bytes)"
                            % (size.get("count"), size.get("bytes")))
@@ -318,12 +353,103 @@ def delivery_markdown(delivery):
         lines.append("- Storage INDEX: %s" % _markdown_url(storage["index_url"]))
     if not dropbox.get("link") and not storage.get("index_url"):
         lines.append("- (Drive copy only)")
+    manifest_file = delivery.get("manifest_file", MANIFEST_NAME)
+    manifest_note = "" if manifest_file == MANIFEST_NAME else " (%s)" % manifest_file
     lines.extend([
         "- Files: %d (%d bytes)" % (delivery["files"], delivery["bytes"]),
-        "- MANIFEST sha256: `%s`" % delivery["manifest_sha256"],
+        "- MANIFEST sha256: `%s`%s" % (delivery["manifest_sha256"], manifest_note),
         "",
     ])
     return "\n".join(lines)
+
+
+def storage_limit_bytes(config):
+    """Largest object the storage fallback may upload (profile STORAGE_MAX_OBJECT_MB)."""
+    raw = (config.get("STORAGE_MAX_OBJECT_MB") or "").strip()
+    try:
+        megabytes = float(raw) if raw else DEFAULT_STORAGE_MAX_OBJECT_MB
+    except ValueError:
+        megabytes = 0
+    if not 0 < megabytes < float("inf"):
+        raise ValueError("STORAGE_MAX_OBJECT_MB must be a positive number of megabytes")
+    return int(megabytes * 1_000_000)
+
+
+def _storage_misfit(config, files):
+    """None when every uploaded file fits the storage limit, else a one-line reason."""
+    limit = storage_limit_bytes(config)
+    big = [(relative, path.stat().st_size) for relative, path in files
+           if relative not in GENERATED_ROOT_NAMES and path.stat().st_size > limit]
+    if not big:
+        return None
+    shown = ", ".join("%s (%.1f MB)" % (relative, size / 1_000_000)
+                      for relative, size in big[:3])
+    more = " and %d more" % (len(big) - 3) if len(big) > 3 else ""
+    return ("not falling back to storage: %s%s over the %g MB per-object limit "
+            "(STORAGE_MAX_OBJECT_MB)" % (shown, more, limit / 1_000_000))
+
+
+def is_insufficient_space(exc):
+    """True when an rclone failure says the Dropbox account is full."""
+    text = "%s %s" % (getattr(exc, "stderr", ""), exc)
+    return "insufficient_space" in text.lower()
+
+
+def cleanup_candidates(config, run=None, state_path=None, exclude=None):
+    """[(name, entry)] still on Dropbox whose Drive copy is confirmed visible.
+
+    Read-only apart from recording fresh DRIVE_CHECK_CMD answers; nothing is deleted.
+    """
+    run = run or _default_run
+    path = state_path or deliveries_path(config)
+    state = load_deliveries(path)
+    rows, changed = [], False
+    for name, entry in sorted(state["deliveries"].items()):
+        remote = (entry.get("dropbox") or {}).get("remote")
+        if entry.get("cleaned") or not remote or name == exclude:
+            continue
+        if entry.get("drive_visible") != "yes":
+            visible = drive_visible(config, name, run=run)
+            if visible != entry.get("drive_visible"):
+                entry["drive_visible"] = visible
+                changed = True
+        if entry.get("drive_visible") == "yes":
+            rows.append((name, entry))
+    if changed:
+        save_deliveries(path, state)
+    return rows
+
+
+def candidate_line(name, entry):
+    return "%s\t%s\t%s bytes\t%s" % (name, entry.get("delivered_utc", "?"),
+                                      entry.get("bytes", "?"), entry["dropbox"]["remote"])
+
+
+def _dropbox_full_notice(config, run, dropbox_remote, remote_dest, name, state_path):
+    """Lines explaining a full Dropbox: rclone about usage plus cleanup candidates."""
+    root = dropbox_remote.split(":", 1)[0] + ":"
+    try:
+        usage = run(["rclone", "about", root]).decode("utf-8", "replace").strip()
+    except (OSError, RuntimeError) as exc:
+        usage = "(rclone about failed: %s)" % exc
+    lines = ["Dropbox is full: rclone reported path/insufficient_space while copying to %s."
+             % remote_dest,
+             "Usage (rclone about %s):" % root]
+    lines.extend("  " + line for line in (usage or "(no output)").splitlines())
+    lines.append("Cleanup candidates (delivered and Drive-confirmed; "
+                 "nothing is deleted automatically):")
+    try:
+        rows = cleanup_candidates(config, run=run, state_path=state_path, exclude=name)
+    except (OSError, ValueError) as exc:
+        rows, lines = [], lines + ["  (could not read the deliveries state: %s)" % exc]
+    else:
+        if not rows:
+            lines.append("  (none)")
+    for row_name, entry in rows:
+        lines.append("  " + candidate_line(row_name, entry))
+        lines.append("    -> review-kit cleanup %s" % row_name)
+    lines.append("Same list: review-kit deliveries --cleanup-candidates")
+    return lines
 
 
 def _deliver_options(config, no_dropbox, force_supabase):
@@ -341,24 +467,32 @@ def _deliver_options(config, no_dropbox, force_supabase):
     return mount, dropbox_remote, want_dropbox
 
 
-def _deliver_plan(name, mount, files, manifest_source, want_dropbox,
-                  force_supabase, dropbox_remote):
+def _deliver_plan(name, mount, files, package_manifest, want_dropbox,
+                  force_supabase, dropbox_remote, config):
     plan = ["Plan for %s:" % name,
             "  drive: copy %d file(s) -> %s%s" % (
                 len(files), mount.rstrip("/") + "/" + name,
                 " over ssh" if _split_ssh_target(mount) else "")]
-    if manifest_source == "generated":
-        plan.append("  drive: write generated %s and verify sha256" % MANIFEST_NAME)
+    if package_manifest.source == "generated":
+        plan.append("  drive: write generated %s and verify sha256" % package_manifest.name)
+        if package_manifest.name != MANIFEST_NAME:
+            plan.append("  drive: the package's own %s is kept untouched" % MANIFEST_NAME)
     else:
-        plan.append("  drive: verify sha256 against existing %s" % MANIFEST_NAME)
+        plan.append("  drive: verify sha256 against existing %s" % package_manifest.name)
     if want_dropbox:
         plan.append("  dropbox: rclone copy/check/size/link -> %s"
                     % dropbox_destination(dropbox_remote, name))
-        plan.append("  storage: upload to the configured backend only if Dropbox fails")
+        plan.append("  storage: upload to the configured backend only if Dropbox fails "
+                    "and every file is within %g MB"
+                    % (storage_limit_bytes(config) / 1_000_000))
     elif force_supabase:
         plan.append("  storage: upload to the configured backend (forced)")
     else:
         plan.append("  dropbox/storage: skipped (--no-dropbox)")
+    if want_dropbox or force_supabase:
+        misfit = _storage_misfit(config, files)
+        if misfit:
+            plan.append("  WARNING: " + misfit)
     plan.append("  record: write %s and update deliveries.json" % DELIVERY_NAME)
     return plan
 
@@ -395,30 +529,44 @@ def deliver_package(config, directory, name, days=7, no_dropbox=False,
     if not files:
         raise ValueError("Delivery input has no files")
     now = now or utc_now()
-    manifest, manifest_data, manifest_source = _resolve_manifest(
-        directory, files, name, now)
-    manifest_sha = hashlib.sha256(manifest_data).hexdigest()
+    package_manifest = _resolve_manifest(directory, files, name, now)
+    manifest = package_manifest.manifest
+    manifest_sha = hashlib.sha256(package_manifest.data).hexdigest()
 
     if dry_run:
         return {"dry_run": True, "name": name,
-                "plan": _deliver_plan(name, mount, files, manifest_source,
-                                      want_dropbox, force_supabase, dropbox_remote)}
+                "plan": _deliver_plan(name, mount, files, package_manifest, want_dropbox,
+                                      force_supabase, dropbox_remote, config)}
+    if force_supabase:
+        misfit = _storage_misfit(config, files)
+        if misfit:
+            raise ValueError(misfit)
 
-    _copy_and_verify_drive(run, mount, name, directory, files, manifest,
-                           manifest_data, manifest_source)
+    _copy_and_verify_drive(run, mount, name, directory, files, package_manifest)
 
-    dropbox_info = None
+    dropbox_info, notices = None, []
     if want_dropbox:
         remote_dest = dropbox_destination(dropbox_remote, name)
         try:
-            link = _upload_dropbox(run, directory, files, remote_dest,
-                                   manifest_data, manifest_source)
+            link = _upload_dropbox(run, directory, files, remote_dest, package_manifest)
             dropbox_info = {"remote": remote_dest, "link": link}
         except (OSError, RuntimeError, ValueError) as exc:
             dropbox_info = {"remote": remote_dest, "error": str(exc)}
+            if is_insufficient_space(exc):
+                dropbox_info["insufficient_space"] = True
+                notices = _dropbox_full_notice(config, run, dropbox_remote, remote_dest,
+                                               name, state_path)
 
     storage_info = None
     if force_supabase or (dropbox_info and "error" in dropbox_info):
+        misfit = None if force_supabase else _storage_misfit(config, files)
+        if misfit:
+            reason = notices or ["Dropbox step failed: %s" % dropbox_info["error"]]
+            raise DeliverStopped("\n".join(reason + [
+                "Delivery stopped: " + misfit,
+                "The Drive copy at %s/%s is complete and verified; no delivery was "
+                "recorded. Free Dropbox space or split the package, then run deliver again."
+                % (mount.rstrip("/"), name)]))
         storage_info = _upload_storage(config, directory, files, name, days,
                                        backend_name, backend_factory)
 
@@ -427,13 +575,14 @@ def deliver_package(config, directory, name, days=7, no_dropbox=False,
                 "drive_path": mount.rstrip("/") + "/" + name,
                 "files": len(manifest["files"]),
                 "bytes": sum(entry["bytes"] for entry in manifest["files"]),
-                "manifest_sha256": manifest_sha, "manifest": manifest_source}
+                "manifest_sha256": manifest_sha, "manifest": package_manifest.source,
+                "manifest_file": package_manifest.name}
     if dropbox_info:
         delivery["dropbox"] = dropbox_info
     if storage_info:
         delivery["storage"] = storage_info
     delivery_path = _record_delivery(config, delivery, directory, state_path)
-    return {"dry_run": False, "delivery": delivery,
+    return {"dry_run": False, "delivery": delivery, "notices": notices,
             "delivery_path": delivery_path, "markdown": delivery_markdown(delivery)}
 
 
