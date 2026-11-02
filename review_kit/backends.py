@@ -471,13 +471,14 @@ class DriveBackend:
         '' or '.' is drive_root itself."""
         path = str(path or "").replace("\\", "/").rstrip("/")
         root = str(self.root).replace("\\", "/").rstrip("/")
-        if path.startswith("/") and root.startswith("~"):
+        absolute = path.startswith("/") or (len(path) > 1 and path[1] == ":")
+        if absolute and root.startswith("~"):
             root = str(self.host.listing_root()).rstrip("/")  # an expanded absolute dest
         if path in ("", ".") or path == root:
             return ""
         if path.startswith(root + "/"):
             path = path[len(root) + 1:]
-        elif path.startswith(("/", "~")) or (len(path) > 1 and path[1] == ":"):
+        elif absolute or path.startswith("~"):
             raise ValueError("Drive destination must be under drive_root (%s)" % self.root)
         return readable_key(path)
 
