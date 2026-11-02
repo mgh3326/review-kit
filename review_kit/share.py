@@ -12,6 +12,7 @@ import time
 import unicodedata
 from urllib.parse import quote
 
+from .backends import create_backend, readable_key
 from .drive import summarize
 
 
@@ -581,14 +582,12 @@ def _upload_fallback(config, name, source, share_id, days, drive_keys, host_name
     return result
 
 
-def share_with_fallback(config, source, drive_dest, host_name=None, hosts=None,
+def share_with_fallback(config, source, drive_dest="", host_name=None, hosts=None,
                         wait=DEFAULT_WAIT_SECONDS, interval=DEFAULT_INTERVAL_SECONDS, days=7,
                         run=None, sleep=time.sleep, clock=time.monotonic,
                         backend_factory=None, now=None):
     """Copy source into Drive and wait for File Provider to upload it; on timeout or
     failure upload it to Dropbox, then to the profile's Supabase/S3 backend."""
-    from .backends import create_backend
-
     def factory(cfg, name, **extra):
         maker = backend_factory or create_backend
         return maker(cfg, name, run=run, hosts=hosts, **extra)
@@ -599,8 +598,8 @@ def share_with_fallback(config, source, drive_dest, host_name=None, hosts=None,
     result = {"source": str(source), "host": host_name or "local", "errors": errors}
     drive = factory(config, "drive", host=host_name)
     dest = drive.relative(drive_dest)
-    drive_keys = {relative: drive.object_key(dest, relative) for relative, _ in files}
-    result["drive_path"] = drive.path(drive.object_key(dest, source.name))
+    drive_keys = {relative: drive.join_key(dest, relative) for relative, _ in files}
+    result["drive_path"] = drive.path(drive.join_key(dest, source.name))
     try:
         for relative, path in files:
             drive.put_file(drive_keys[relative], path, content_type(path), sha256_file(path))
@@ -696,8 +695,6 @@ def _gc_drive_pass(ledger, backends):
 def share_gc(config, apply=False, hosts=None, run=None, backend_factory=None, now=None):
     """Delete Dropbox/Supabase/S3 packages whose files Drive holds uploaded with the same
     sha256, then prune any backend above its capacity mark. Dry run unless apply."""
-    from .backends import create_backend
-
     def factory(cfg, name, **extra):
         return (backend_factory or create_backend)(cfg, name, run=run, hosts=hosts, **extra)
 
@@ -755,30 +752,55 @@ def _append_log(path, row):
         log.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def import_legacy_ledger(ledger_path, legacy_path, backend_name):
-    """Track packages from a flat dots-share ledger ({prefix: {uploaded, expires, ...}}).
-
-    Their object keys are not recorded, so done/prune list them by prefix.
-    """
-    try:
-        legacy = json.loads(Path(legacy_path).expanduser().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        raise ValueError("Could not read the legacy ledger")
-    if not isinstance(legacy, dict) or "packages" in legacy:
-        raise ValueError("Legacy ledger must be a flat {prefix: record} object")
-    ledger = load_ledger(ledger_path)
-    added, skipped = [], []
-    for prefix, old in sorted(legacy.items()):
+def _legacy_entries(data, dropbox_remote):
+    """(ledger key, record) pairs from a flat dots-share ledger or a deliveries.json."""
+    if isinstance(data, dict) and isinstance(data.get("deliveries"), dict):
+        remote = (dropbox_remote or "").strip().rstrip("/")
+        for name, entry in sorted(data["deliveries"].items()):
+            target = ((entry or {}).get("dropbox") or {}).get("remote")
+            if entry.get("cleaned") or not target or entry["dropbox"].get("error"):
+                continue  # only live Dropbox copies; deliver's storage copies are in the ledger
+            if not remote or not target.startswith(remote + "/"):
+                raise ValueError("Delivery %s is outside DROPBOX_REMOTE; set the profile's "
+                                 "DROPBOX_REMOTE to the one deliver used" % name)
+            prefix = target[len(remote) + 1:]
+            yield readable_key(prefix), {
+                "uploaded": entry.get("delivered_utc"), "expires": None,
+                "bytes": int(entry.get("bytes", 0)), "backend": "dropbox", "objects": [],
+                "legacy": True, "legacy_prefix": prefix, "source": entry.get("drive_path")}
+        return
+    if not isinstance(data, dict) or "packages" in data:
+        raise ValueError("Expected a flat dots-share ledger or a deliveries.json")
+    for prefix, old in sorted(data.items()):
         if not isinstance(old, dict) or "uploaded" not in old:
             raise ValueError("Legacy ledger entry %s has no upload date" % prefix)
-        key = safe_key(prefix)
+        yield safe_key(prefix), {
+            "uploaded": old["uploaded"], "expires": old.get("expires"),
+            "bytes": int(old.get("bytes", 0)), "backend": None, "objects": [],
+            "legacy": True, "legacy_prefix": prefix, "source": old.get("source")}
+
+
+def import_legacy_ledger(ledger_path, legacy_path, backend_name, dropbox_remote=None):
+    """One-shot migration into the profile ledger.
+
+    Accepts the flat dots-share ledger ({prefix: {uploaded, expires, ...}}, tracked under
+    backend_name) or the deliveries.json of the removed deliver command (its live Dropbox
+    copies, tracked under dropbox). Object keys were never recorded, so done/prune list
+    these packages by prefix.
+    """
+    try:
+        data = json.loads(Path(legacy_path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ValueError("Could not read the legacy ledger")
+    ledger = load_ledger(ledger_path)
+    added, skipped = [], []
+    for key, record in list(_legacy_entries(data, dropbox_remote)):
+        if record["backend"] is None:
+            record["backend"] = backend_name
         if key in ledger["packages"]:
             skipped.append(key)
             continue
-        ledger["packages"][key] = {
-            "uploaded": old["uploaded"], "expires": old.get("expires"),
-            "bytes": int(old.get("bytes", 0)), "backend": backend_name, "objects": [],
-            "legacy": True, "legacy_prefix": prefix, "source": old.get("source")}
+        ledger["packages"][key] = record
         added.append(key)
     save_ledger(ledger_path, ledger)
     return added, skipped

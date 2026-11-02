@@ -205,7 +205,9 @@ drive_root = "/Users/you/Library/CloudStorage/GoogleDrive-<account>/My Drive"
 # fileproviderctl = "/usr/bin/fileproviderctl"   # optional
 ```
 
-`ssh` runs with `BatchMode=yes`, so set up key authentication first. The mount host needs `fileproviderctl`, `shasum` and `rsync` (all ship with macOS). Without a `[local]` entry, a local `DRIVE_MOUNT_DIR` in the profile is used as the local Drive root.
+`ssh` runs with `BatchMode=yes`, so set up key authentication first. The mount host needs `fileproviderctl`, `shasum` and `rsync` (all ship with macOS).
+
+A profile that already sets `DRIVE_MOUNT_DIR` (as the earlier `deliver` command used it) keeps working without `hosts.toml`. When `--host` is not given, `DRIVE_MOUNT_DIR` is the Drive root and takes precedence over `[local]`. It may be a local path or an ssh target `[user@]host:/path`. `drive-dest` is optional, so `review-kit --profile work share ./pa-review-123` copies to `DRIVE_MOUNT_DIR/pa-review-123`, like `deliver` did. `DROPBOX_REMOTE`, `BACKEND`, `SUPABASE_BUCKET`, `SUPABASE_ENV_FILE` and `MIRO_ENV_FILE` are read as before.
 
 #### share-gc
 
@@ -224,7 +226,16 @@ DROPBOX_HIGH_WATER_MB=1500
 DROPBOX_LOW_WATER_MB=1200
 ```
 
-`import-ledger <ledger.json>` tracks the packages in an older flat `{prefix: {uploaded, expires, bytes}}` ledger under the selected backend (`--backend` or `BACKEND`). Their object keys were never recorded, so `done` and `prune` list them by prefix.
+`import-ledger <file.json>` is a one-shot migration into the profile ledger:
+
+- An older flat dots-share ledger (`{prefix: {uploaded, expires, bytes}}`) is tracked under the selected backend (`--backend` or `BACKEND`).
+- The `deliveries.json` of the removed `deliver` command (`~/.local/state/review-kit/deliveries.json`) has its live Dropbox copies tracked under `dropbox`, using the profile's `DROPBOX_REMOTE`. Its storage copies were already in the ledger.
+
+Their object keys were never recorded, so `done` and `prune` list them by prefix:
+
+```bash
+review-kit --profile work import-ledger ~/.local/state/review-kit/deliveries.json
+```
 
 This replaces the earlier `deliver`, `cleanup`, `drive-visible` and `deliveries` commands: use `share`, `share-gc`, `drive-status` and `status`.
 

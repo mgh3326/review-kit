@@ -57,7 +57,8 @@ def _parser():
     gc.add_argument("--json", action="store_true")
 
     legacy = commands.add_parser(
-        "import-ledger", help="track packages from a flat dots-share ledger JSON")
+        "import-ledger",
+        help="one-shot: track packages from a dots-share ledger or deliver's deliveries.json")
     legacy.add_argument("legacy", type=Path, metavar="ledger.json")
 
     verify = commands.add_parser("verify", help="check a downloaded folder against MANIFEST.json")
@@ -138,8 +139,9 @@ def _share_drive_parser():
                     "every file uploaded; on timeout fall back to Dropbox, then storage. "
                     "(`review-kit share upload -h` shows the storage upload form.)")
     share.add_argument("source", type=Path, metavar="src")
-    share.add_argument("drive_dest", metavar="drive-dest",
-                       help="Drive folder: absolute, ~, or relative to the host's drive_root")
+    share.add_argument("drive_dest", metavar="drive-dest", nargs="?", default="",
+                       help="Drive folder: absolute, or relative to the Drive root "
+                            "(DRIVE_MOUNT_DIR or drive_root); default: the root itself")
     share.add_argument("--host", help="mount host from hosts.toml; copy with rsync over ssh")
     share.add_argument("--wait", default="10m", help="upload wait before falling back (10m)")
     share.add_argument("--interval", default="15s", help="poll interval while waiting (15s)")
@@ -210,9 +212,9 @@ def _run_share_gc(args):
 def _run_import_ledger(args):
     config = load_config(args.profile, args.config)
     backend_name = (args.backend or config.get("BACKEND") or "supabase").lower()
-    added, skipped = import_legacy_ledger(config["_LEDGER_PATH"], args.legacy, backend_name)
-    print("Imported %d package(s) as %s; %d already tracked" % (len(added), backend_name,
-                                                               len(skipped)))
+    added, skipped = import_legacy_ledger(config["_LEDGER_PATH"], args.legacy, backend_name,
+                                          dropbox_remote=config.get("DROPBOX_REMOTE"))
+    print("Imported %d package(s); %d already tracked" % (len(added), len(skipped)))
     return 0
 
 

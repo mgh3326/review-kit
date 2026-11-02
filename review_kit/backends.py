@@ -467,14 +467,21 @@ class DriveBackend:
         return self.host.join(self.root, key) if key else self.root
 
     def relative(self, path):
-        """A key for a Drive path given absolute (under drive_root) or relative to it."""
-        path = str(path).replace("\\", "/")
+        """A key for a Drive folder given absolute (under drive_root) or relative to it;
+        '' or '.' is drive_root itself."""
+        path = str(path or "").replace("\\", "/").rstrip("/")
         root = str(self.root).replace("\\", "/").rstrip("/")
-        if path == root or path.startswith(root + "/"):
+        if path in ("", ".") or path == root:
+            return ""
+        if path.startswith(root + "/"):
             path = path[len(root) + 1:]
         elif path.startswith(("/", "~")) or (len(path) > 1 and path[1] == ":"):
             raise ValueError("Drive destination must be under drive_root (%s)" % self.root)
         return readable_key(path)
+
+    @staticmethod
+    def join_key(folder, relative):
+        return readable_key(folder, relative) if folder else readable_key(relative)
 
     def put_file(self, key, path, content_type, digest):
         target = self.path(key)

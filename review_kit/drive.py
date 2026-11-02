@@ -188,7 +188,7 @@ class LocalHost:
     def __init__(self, entry=None, run=None, drive_root=None):
         entry = entry or {}
         self.run = run or default_run
-        root = entry.get("drive_root") or drive_root or ""
+        root = drive_root or entry.get("drive_root") or ""
         self.drive_root = os.path.expanduser(root) if root else ""
         self.fileproviderctl = (os.environ.get("REVIEW_KIT_FILEPROVIDERCTL") or
                                 entry.get("fileproviderctl") or "fileproviderctl")
@@ -339,17 +339,26 @@ class SshHost(LocalHost):
             self._checked(["rm", "-f", "--"] + list(paths))
 
 
-LEGACY_SSH_MOUNT = re.compile(r"^(?:[A-Za-z0-9_.-]+@)?[A-Za-z0-9_.-]{2,}:")
+# The profile key the earlier `deliver` command used: a local path or [user@]host:/path.
+MOUNT_SSH_TARGET = re.compile(r"^((?:[A-Za-z0-9_.-]+@)?[A-Za-z0-9_.-]{2,}):(.+)$")
+PROFILE_MOUNT = "DRIVE_MOUNT_DIR"
 
 
 def make_host(hosts, name=None, run=None, config=None):
-    """LocalHost for no name, else the SshHost configured as [hosts.<name>]."""
+    """The default Drive host for no name, else the SshHost configured as [hosts.<name>].
+
+    The default is the profile's DRIVE_MOUNT_DIR when set (a local path, or an ssh
+    target host:/path as `deliver` accepted), else [local] in hosts.toml.
+    """
     config = config or {}
     hosts = hosts or {}
     if not name or name == "local":
-        mount = (config.get("DRIVE_MOUNT_DIR") or "").strip()
-        local_mount = "" if LEGACY_SSH_MOUNT.match(mount) else mount
-        return LocalHost(hosts.get("local"), run=run, drive_root=local_mount)
+        mount = (config.get(PROFILE_MOUNT) or "").strip()
+        target = MOUNT_SSH_TARGET.match(mount)
+        if target:
+            return SshHost(PROFILE_MOUNT, {"ssh": target.group(1), "drive_root": target.group(2)},
+                           run=run)
+        return LocalHost(hosts.get("local"), run=run, drive_root=mount)
     if not HOST_NAME.fullmatch(name):
         raise ValueError("Host names may use letters, digits, dot, underscore and dash")
     entry = hosts.get("hosts", {}).get(name)

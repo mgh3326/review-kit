@@ -178,7 +178,9 @@ drive_root = "/Users/you/Library/CloudStorage/GoogleDrive-<account>/My Drive"
 # fileproviderctl = "/usr/bin/fileproviderctl"   # 선택
 ```
 
-`ssh`는 `BatchMode=yes`로 실행하므로 키 인증을 먼저 설정해야 합니다. 마운트 호스트에는 `fileproviderctl`, `shasum`, `rsync`가 필요하며 모두 macOS 기본 도구입니다. `[local]`이 없으면 프로필의 로컬 `DRIVE_MOUNT_DIR`를 로컬 Drive 루트로 씁니다.
+`ssh`는 `BatchMode=yes`로 실행하므로 키 인증을 먼저 설정해야 합니다. 마운트 호스트에는 `fileproviderctl`, `shasum`, `rsync`가 필요하며 모두 macOS 기본 도구입니다.
+
+예전 `deliver` 명령처럼 `DRIVE_MOUNT_DIR`를 설정한 프로필은 `hosts.toml` 없이도 그대로 동작합니다. `--host`를 지정하지 않으면 `DRIVE_MOUNT_DIR`가 Drive 루트가 되며 `[local]`보다 우선합니다. 값은 로컬 경로이거나 ssh 대상(`[user@]host:/path`)일 수 있습니다. `drive-dest`는 생략할 수 있어서, `review-kit --profile work share ./pa-review-123`은 `deliver`처럼 `DRIVE_MOUNT_DIR/pa-review-123`에 복사합니다. `DROPBOX_REMOTE`, `BACKEND`, `SUPABASE_BUCKET`, `SUPABASE_ENV_FILE`, `MIRO_ENV_FILE`도 전과 같이 읽습니다.
 
 #### share-gc
 
@@ -197,7 +199,16 @@ DROPBOX_HIGH_WATER_MB=1500
 DROPBOX_LOW_WATER_MB=1200
 ```
 
-`import-ledger <ledger.json>`은 예전의 평면 원장(`{prefix: {uploaded, expires, bytes}}`)에 있는 패키지를 선택한 저장소(`--backend` 또는 `BACKEND`) 아래에서 추적하게 합니다. 이 패키지들은 객체 키가 기록되지 않았으므로 `done`과 `prune`이 prefix로 목록을 조회해 처리합니다.
+`import-ledger <file.json>`은 프로필 원장으로 한 번만 실행하는 이전 도구입니다.
+
+- 예전 dots-share 평면 원장(`{prefix: {uploaded, expires, bytes}}`): 패키지를 선택한 저장소(`--backend` 또는 `BACKEND`) 아래에서 추적합니다.
+- 삭제된 `deliver` 명령의 `deliveries.json`(`~/.local/state/review-kit/deliveries.json`): 남아 있는 Dropbox 사본을 프로필의 `DROPBOX_REMOTE` 기준으로 `dropbox` 아래에서 추적합니다. 스토리지 사본은 이미 원장에 있습니다.
+
+이 패키지들은 객체 키가 기록되지 않았으므로 `done`과 `prune`이 prefix로 목록을 조회해 처리합니다.
+
+```bash
+review-kit --profile work import-ledger ~/.local/state/review-kit/deliveries.json
+```
 
 이 기능은 예전 `deliver`, `cleanup`, `drive-visible`, `deliveries` 명령을 대체합니다. 대신 `share`, `share-gc`, `drive-status`, `status`를 쓰세요.
 

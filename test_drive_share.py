@@ -580,5 +580,77 @@ class ShareGcTests(Base):
         self.assertEqual(share.import_legacy_ledger(self.ledger, legacy, "supabase")[0], ["rev-1"])
 
 
+class DeliverProfileTests(Base):
+    """The desk's existing deliver profile keys keep working with share."""
+
+    def _profile(self, mount):
+        supabase = self.root / "supabase.env"
+        supabase.write_text("SUPABASE_URL=https://supabase.example.invalid\n"
+                            "SUPABASE_SECRET_KEY=dummy-not-a-secret\n", encoding="utf-8")
+        miro = self.root / "miro.env"
+        miro.write_text("MIRO_ACCESS_TOKEN=dummy-not-a-token\n", encoding="utf-8")
+        profile = self.root / "cfg" / "dots-deliver.env"
+        profile.parent.mkdir()
+        profile.write_text("DRIVE_MOUNT_DIR=%s\nDROPBOX_REMOTE=dropbox:Project/review\n"
+                           "BACKEND=supabase\nSUPABASE_BUCKET=review-bucket\n"
+                           "SUPABASE_ENV_FILE=%s\nMIRO_ENV_FILE=%s\n"
+                           % (mount, supabase, miro), encoding="utf-8")
+        return profile
+
+    def test_deliver_profile_keys_drive_share_unchanged(self):
+        profile = self._profile(self.drive_root / "reviews")
+        (profile.parent / "hosts.toml").write_text(
+            '[local]\ndrive_root = "%s"\n' % (self.root / "elsewhere").as_posix(),
+            encoding="utf-8")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"REVIEW_KIT_CONFIG_DIR": str(profile.parent)}), \
+                mock.patch.object(drive, "default_run", self.world), \
+                contextlib.redirect_stdout(out):
+            code = cli.main(["--profile", "dots-deliver", "share", str(self.source),
+                             "--wait", "0"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(out.getvalue().splitlines(),
+                         ["route: drive", "drive: %s" % (self.drive_root / "reviews" / "pack")])
+        self.assertEqual((self.drive_root / "reviews" / "pack" / "data.csv").read_bytes(),
+                         b"x,y\n1,2\n")
+        config = cli.load_config(config_path=str(profile))
+        self.assertEqual(create_backend(config).name, "supabase")
+        self.assertEqual(DropboxBackend(config).remote, "dropbox:Project/review")
+        self.assertEqual(config["MIRO_ACCESS_TOKEN"], "dummy-not-a-token")
+
+    def test_ssh_form_of_drive_mount_dir(self):
+        self.config["DRIVE_MOUNT_DIR"] = "%s:%s" % (SSH_DEST, self.remote_root.as_posix())
+        result = self.share(hosts={"local": {"drive_root": str(self.drive_root)}})
+        self.assertEqual(result["route"], "drive")
+        self.assertEqual(result["drive_path"], (self.remote_root / "reviews" / "pack").as_posix())
+        self.assertTrue((self.remote_root / "reviews" / "pack" / "clips" / "a.mp4").exists())
+        self.assertFalse((self.drive_root / "reviews").exists())
+
+    def test_import_deliveries_json_tracks_live_dropbox_copies(self):
+        self.config["DROPBOX_REMOTE"] = "dropbox:Project/review"
+        self.world.dropbox = {"dropbox:Project/review/rev-1/a.png": b"a",
+                              "dropbox:Project/review/rev-1/MANIFEST.json": b"{}",
+                              "dropbox:Project/review/rev-2/b.png": b"b"}
+        deliveries = self.root / "deliveries.json"
+        deliveries.write_text(json.dumps({"schema_version": 1, "deliveries": {
+            "rev-1": {"delivered_utc": "2026-10-30T00:00:00+00:00", "bytes": 3, "cleaned": False,
+                      "dropbox": {"remote": "dropbox:Project/review/rev-1",
+                                  "link": "https://dropbox.example.test/s/1"}},
+            "rev-2": {"delivered_utc": "2026-10-30T00:00:00+00:00", "cleaned": True,
+                      "dropbox": {"remote": "dropbox:Project/review/rev-2"}},
+            "rev-3": {"delivered_utc": "2026-10-30T00:00:00+00:00", "cleaned": False,
+                      "storage": {"index_url": "https://x"}}}}), encoding="utf-8")
+        added, _ = share.import_legacy_ledger(self.ledger, deliveries, "supabase",
+                                              dropbox_remote=self.config["DROPBOX_REMOTE"])
+        self.assertEqual(added, ["rev-1"])
+        self.assertEqual(load_ledger(self.ledger)["packages"]["rev-1"]["backend"], "dropbox")
+        backend = DropboxBackend(self.config, run=self.world)
+        self.assertEqual(share.done_package(backend, self.ledger, "rev-1"), 2)
+        self.assertEqual(sorted(self.world.dropbox), ["dropbox:Project/review/rev-2/b.png"])
+        with self.assertRaisesRegex(ValueError, "outside DROPBOX_REMOTE"):
+            share.import_legacy_ledger(self.ledger, deliveries, "supabase",
+                                       dropbox_remote="dropbox:other")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
