@@ -135,6 +135,8 @@ def _files_under(folder):
     files = []
     for root, directories, names in os.walk(str(folder), followlinks=False):
         root_path = Path(root)
+        # Hidden folders (.git, .venv, ...) are never shared, like dotfiles.
+        directories[:] = [d for d in directories if not d.startswith(".")]
         for directory in list(directories):
             if (root_path / directory).is_symlink():
                 raise ValueError("Symbolic-link directories are not supported in upload folders")

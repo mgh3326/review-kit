@@ -225,7 +225,8 @@ class LocalHost:
     @staticmethod
     def _walk(path):
         for root, directories, names in os.walk(path):
-            directories.sort()
+            # Hidden folders (.git, .Trash, ...) are pruned, like the remote find below.
+            directories[:] = sorted(d for d in directories if not d.startswith("."))
             for name in sorted(names):
                 if not name.startswith("."):
                     yield os.path.join(root, name)
@@ -252,6 +253,9 @@ class LocalHost:
 
     def exists(self, path):
         return os.path.lexists(path)
+
+    def symlinks(self, paths):
+        return [path for path in paths if os.path.islink(path)]
 
     def remove(self, paths):
         for path in paths:
@@ -301,7 +305,10 @@ class SshHost(LocalHost):
         return self._evaluate_output((code, out, err))
 
     def _find(self, path, *extra):
-        code, out, err = self.ssh(["find", path, "-type", "f", "!", "-name", ".*"] + list(extra))
+        # Below path, any entry named .* is skipped, and a hidden folder is not entered.
+        action = list(extra) or ["-print"]
+        code, out, err = self.ssh(["find", path, "-mindepth", "1", "-name", ".*", "-prune",
+                                   "-o", "-type", "f"] + action)
         if code == 255:
             raise RuntimeError("ssh to %s failed: %s" % (self.label, _short(err)))
         return code, sorted(line for line in _decode(out).splitlines() if line)
@@ -344,6 +351,11 @@ class SshHost(LocalHost):
         if code:
             raise RuntimeError("rsync to %s failed (exit %d): %s"
                                % (self.label, code, _short(err)))
+
+    def symlinks(self, paths):
+        script = 'for p in "$@"; do if [ -L "$p" ]; then printf "%s\\n" "$p"; fi; done'
+        out = self._checked(["sh", "-c", script, "sh"] + list(paths)) if paths else b""
+        return [line for line in _decode(out).splitlines() if line]
 
     def exists(self, path):
         code, _, err = self.ssh(["test", "-e", path, "-o", "-L", path])

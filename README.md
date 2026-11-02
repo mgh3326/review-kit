@@ -180,11 +180,11 @@ The routes are backends of the same share code, tried in this order:
 2. **dropbox**: on timeout or copy failure, `share upload` to `DROPBOX_REMOTE` with rclone (`copyto`, `link`). It prints `route: dropbox` and the INDEX link.
 3. **supabase / s3**: when Dropbox fails, `share upload` to the storage backend with signed links: the global `--backend`, else the profile's `BACKEND`, else `supabase`. It prints `route: supabase` (or `s3`) and the INDEX link. Each route is tried once: with `BACKEND=dropbox` (or `drive`) there is no storage step.
 
-`share` never overwrites a Drive file. When a file under `drive-dest` already holds other bytes, it stops before copying anything and does not fall back; choose another `drive-dest` or move the old file. A file with the same SHA256 is left as it is.
+`share` never overwrites a Drive file. When a file under `drive-dest` already holds other bytes, it stops before copying anything and does not fall back; choose another `drive-dest` or move the old file. A file with the same SHA256 is left as it is. A symbolic link anywhere below the Drive root on the way to a file is refused too, so a copy cannot land outside Drive. Dropbox uploads refuse other bytes under an existing key in the same way; `resign` still rewrites `INDEX.md` and the manifest in place.
 
 When rclone reports `path/insufficient_space`, the note says Dropbox is full, gives the `rclone about` usage, and lists the Dropbox packages that `share-gc --apply` would remove. Nothing is deleted; `share` goes on to the storage step.
 
-Exit status is 0 when any route worked. The reason for each fallback goes to stderr as `note: ...`. Dropbox and storage packages are recorded in the profile ledger together with the Drive path of each file, so `status`, `done`, `prune`, `resign` and `ls` work on them, and `--backend dropbox` (or `drive`) works with every command. Rclone share links do not expire, so on Dropbox the INDEX expiry date is a review window only. Dotfiles (`.DS_Store` and similar) are never shared.
+Exit status is 0 when any route worked. The reason for each fallback goes to stderr as `note: ...`. Dropbox and storage packages are recorded in the profile ledger together with the Drive path of each file, so `status`, `done`, `prune`, `resign` and `ls` work on them, and `--backend dropbox` (or `drive`) works with every command. Rclone share links do not expire, so on Dropbox the INDEX expiry date is a review window only. Dotfiles (`.DS_Store` and similar) and hidden folders (`.git/` and similar) are never shared or listed.
 
 #### Check upload state
 

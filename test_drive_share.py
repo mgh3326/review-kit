@@ -31,8 +31,12 @@ def evaluate_output(uploaded, uploading):
 
 
 def walk_files(root):
-    return sorted(os.path.join(r, n) for r, _, names in os.walk(root) for n in names
-                  if not n.startswith("."))
+    """Files below root, skipping dotfiles and not entering hidden folders."""
+    found = []
+    for base, directories, names in os.walk(root):
+        directories[:] = [d for d in directories if not d.startswith(".")]
+        found.extend(os.path.join(base, n) for n in names if not n.startswith("."))
+    return sorted(found)
 
 
 class FakeWorld:
@@ -58,6 +62,7 @@ class FakeWorld:
 
     def _find(self, words):
         root = words[1]
+        assert words[2:8] == ["-mindepth", "1", "-name", ".*", "-prune", "-o"], words
         if not os.path.exists(root):
             return 1, b"", b"No such file"
         # Like macOS find: '/'-separated paths even when the fake runs on Windows.
@@ -90,6 +95,9 @@ class FakeWorld:
         if words[:2] == ["mkdir", "-p"]:
             Path(words[2]).mkdir(parents=True, exist_ok=True)
             return 0, b"", b""
+        if words[:2] == ["sh", "-c"] and words[2].startswith('for p in "$@"; do if [ -L'):
+            linked = [path for path in words[4:] if os.path.islink(path)]
+            return 0, "".join(path + "\n" for path in linked).encode(), b""
         if words[:2] == ["sh", "-c"] and words[2] == 'cat > "$1"':
             Path(words[4]).write_bytes(stdin)
             return 0, b"", b""
@@ -387,8 +395,72 @@ class BackendTests(Base):
         self.assertTrue((self.drive_root / "big.mp4").exists())
 
     def test_upload_skips_dotfiles_like_dots_share(self):
+        (self.source / ".git").mkdir()
+        (self.source / ".git" / "config").write_bytes(b"[remote]")
         upload_folder(self.source, "pkg", 7, self.backend, self.ledger)
         self.assertFalse(any(".DS_Store" in key for key in self.backend.objects))
+        self.assertFalse(any(".git" in key for key in self.backend.objects))
+        self.assertTrue(any(key.endswith("/data.csv") for key in self.backend.objects))
+
+    def test_hidden_folders_are_not_listed_on_either_host(self):
+        for host_name, root in ((None, self.drive_root), ("mount", self.remote_root)):
+            (root / "pack" / ".git").mkdir(parents=True)
+            (root / "pack" / ".git" / "config").write_bytes(b"[remote]")
+            (root / "pack" / "a.mp4").write_bytes(b"a")
+            host = drive.make_host(self.hosts, host_name, run=self.world)
+            self.assertEqual([Path(f).name for f in host.files_under(str(root / "pack"))],
+                             ["a.mp4"])
+
+    def test_drive_resign_rewrites_index_and_manifest(self):
+        backend = create_backend(self.config, "drive", run=self.world, hosts=self.hosts)
+        upload_folder(self.source, "pkg", 1, backend, self.ledger, backend_name="drive")
+        before = (self.drive_root / "pkg" / "INDEX.md").read_bytes()
+        resigned = share.resign_package(backend, self.ledger, "pkg", days=3)
+        self.assertNotEqual(resigned["index"], before)
+        self.assertEqual((self.drive_root / "pkg" / "INDEX.md").read_bytes(), resigned["index"])
+        self.assertEqual((self.drive_root / "pkg" / "MANIFEST.json").read_bytes(),
+                         resigned["manifest"])
+
+    def test_drive_refuses_symlinks_below_the_root(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        for host_name, root in ((None, self.drive_root), ("mount", self.remote_root)):
+            try:
+                os.symlink(str(outside), str(root / "reviews"), target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest("no symlinks here: %s" % exc)
+            backend = create_backend(self.config, "drive", run=self.world, hosts=self.hosts,
+                                     host=host_name)
+            data = b"bytes"
+            with self.assertRaisesRegex(ValueError, "is a symbolic link"):
+                backend.put_bytes("reviews/INDEX.md", data, "text/markdown",
+                                  hashlib.sha256(data).hexdigest())
+            with self.assertRaisesRegex(ValueError, "is a symbolic link"):
+                self.share(host_name=host_name)
+            self.assertEqual(os.listdir(str(outside)), [])
+
+    def test_dropbox_never_overwrites_other_bytes(self):
+        folder = self.root / "pkg-src"
+        folder.mkdir()
+        (folder / "a.txt").write_bytes(b"new")
+        (folder / "b.txt").write_bytes(b"b")
+        earlier = "dropbox:review-share/pkg/b.txt"
+        self.world.dropbox[earlier] = b"someone else's file"
+        backend = DropboxBackend(self.config, run=self.world)
+        with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite pkg/b.txt"):
+            upload_folder(folder, "pkg", 7, backend, self.ledger, backend_name="dropbox")
+        # The rollback removed only what this upload created.
+        self.assertEqual(self.world.dropbox, {earlier: b"someone else's file"})
+        digest = hashlib.sha256(b"b").hexdigest()
+        self.world.dropbox[earlier] = b"b"
+        self.assertFalse(backend.put_file("pkg/b.txt", folder / "b.txt", "text/plain", digest))
+
+    def test_dropbox_resign_rewrites_index(self):
+        backend = DropboxBackend(self.config, run=self.world)
+        upload_folder(self.source, "pkg", 1, backend, self.ledger, backend_name="dropbox")
+        resigned = share.resign_package(backend, self.ledger, "pkg", days=3)
+        self.assertEqual(self.world.dropbox["dropbox:review-share/pkg/INDEX.md"],
+                         resigned["index"])
 
 
 class ShareTests(Base):

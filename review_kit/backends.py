@@ -483,10 +483,21 @@ class DriveBackend:
     def join_key(folder, relative):
         return readable_key(folder, relative) if folder else readable_key(relative)
 
+    def _target(self, key):
+        """The Drive path for key. A symbolic link at any level below drive_root (or the
+        file itself) could point outside Drive, so it is refused before any write."""
+        parts = [part for part in str(key).split("/") if part]
+        chain = [self.host.join(self.root, *parts[:depth]) for depth in range(1, len(parts) + 1)]
+        linked = self.host.symlinks(chain)
+        if linked:
+            raise DriveConflict("Refusing %s: %s is a symbolic link; Drive copies stay "
+                                "under drive_root" % (self.path(key), linked[0]))
+        return self.path(key)
+
     def already_there(self, key, digest):
         """True when key holds digest, False when it is free; DriveConflict otherwise,
         so an existing Drive file is never overwritten with other bytes."""
-        target = self.path(key)
+        target = self._target(key)
         current = self.host.sha256(target)
         if current == digest:
             return True
@@ -498,11 +509,14 @@ class DriveBackend:
     def put_file(self, key, path, content_type, digest):
         if self.already_there(key, digest):
             return False
-        target = self.path(key)
+        self._copy(key, path, digest)
+        return True
+
+    def _copy(self, key, path, digest):
+        target = self._target(key)
         self.host.put_file(path, target)
         if self.host.sha256(target) != digest:
             raise RuntimeError("Drive copy of %s does not match its sha256" % key)
-        return True
 
     def put_bytes(self, key, data, content_type, digest):
         name = _temporary_copy(data)
@@ -512,7 +526,12 @@ class DriveBackend:
             os.unlink(name)
 
     def replace_bytes(self, key, data, content_type, digest):
-        self.put_bytes(key, data, content_type, digest)
+        """resign rewrites INDEX/MANIFEST in place: no overwrite refusal, same checks."""
+        name = _temporary_copy(data)
+        try:
+            self._copy(key, name, digest)
+        finally:
+            os.unlink(name)
 
     def object_sha256(self, key):
         return self.host.sha256(self.path(key))
@@ -530,7 +549,7 @@ class DriveBackend:
         return sorted(found)
 
     def delete_keys(self, keys):
-        self.host.remove([self.path(key) for key in keys])
+        self.host.remove([self._target(key) for key in keys])
 
     def upload_status(self, keys):
         """drive_status for the Drive files behind keys (File Provider upload state)."""
@@ -598,8 +617,17 @@ class DropboxBackend:
         return self.remote + "/" + key if key else self.remote
 
     def put_file(self, key, path, content_type, digest):
-        self._rclone("copyto", str(path), self._path(key))
+        current = self.object_sha256(key)
+        if current == digest:
+            return False
+        if current is not None:
+            raise RuntimeError("Refusing to overwrite %s on Dropbox: it holds different bytes"
+                               % key)
+        self._copy(key, path)
         return True
+
+    def _copy(self, key, path):
+        self._rclone("copyto", str(path), self._path(key))
 
     def put_bytes(self, key, data, content_type, digest):
         name = _temporary_copy(data)
@@ -609,7 +637,11 @@ class DropboxBackend:
             os.unlink(name)
 
     def replace_bytes(self, key, data, content_type, digest):
-        self.put_bytes(key, data, content_type, digest)
+        name = _temporary_copy(data)
+        try:
+            self._copy(key, name)
+        finally:
+            os.unlink(name)
 
     def object_sha256(self, key):
         out = self._rclone("hashsum", "sha256", "--download", self._path(key), missing_ok=True)
