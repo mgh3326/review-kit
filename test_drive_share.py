@@ -104,10 +104,14 @@ class FakeWorld:
             linked = [path for path in words[4:] if os.path.islink(path)]
             return 0, "".join(path + "\n" for path in linked).encode(), b""
         if words[:2] == ["sh", "-c"] and words[2] == drive.SSH_WRITE_SCRIPT:
+            # mktemp -d beside the target, write, rename, remove the stage.
             target = Path(words[4])
-            partial = target.with_name(".%s.review-kit-partial" % target.name)
-            partial.write_bytes(stdin)
-            os.replace(str(partial), str(target))
+            if target.is_dir():
+                return 1, b"", b""
+            stage = tempfile.mkdtemp(prefix=drive.STAGING_PREFIX, dir=str(target.parent))
+            Path(stage, "data").write_bytes(stdin)
+            os.replace(os.path.join(stage, "data"), str(target))
+            shutil.rmtree(stage)
             return 0, b"", b""
         if words[:3] == ["rm", "-f", "--"]:
             for path in words[3:]:
@@ -489,6 +493,49 @@ class BackendTests(Base):
         # A retry is not blocked by a leftover "conflict".
         self.assertTrue(backend.put_bytes("reviews/clip.mp4", data, "video/mp4", digest))
         self.assertEqual(target.read_bytes(), data)
+
+    def test_drive_copy_ignores_planted_staging_names(self):
+        # The old fixed staging name, pre-planted as a link to a file outside Drive.
+        outside = self.root / "outside.txt"
+        outside.write_bytes(b"keep me")
+        data = b"review bytes"
+        digest = hashlib.sha256(data).hexdigest()
+        for host_name, root in ((None, self.drive_root), ("mount", self.remote_root)):
+            folder = root / "reviews"
+            folder.mkdir()
+            planted = folder / ".clip.mp4.review-kit-partial"
+            try:
+                os.symlink(str(outside), str(planted))
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest("no symlinks here: %s" % exc)
+            backend = create_backend(self.config, "drive", run=self.world, hosts=self.hosts,
+                                     host=host_name)
+            self.assertTrue(backend.put_bytes("reviews/clip.mp4", data, "video/mp4", digest))
+            self.assertEqual((folder / "clip.mp4").read_bytes(), data)
+            self.assertEqual(outside.read_bytes(), b"keep me")
+            # Only the target is new: the stage this copy made is gone, the planted link stays.
+            self.assertEqual(sorted(os.listdir(str(folder))),
+                             [".clip.mp4.review-kit-partial", "clip.mp4"])
+
+    def test_each_drive_copy_stages_in_its_own_private_directory(self):
+        seen = []
+        real = drive.shutil.copyfile
+
+        def record(source, destination):
+            stage = os.path.dirname(destination)
+            seen.append(stage)
+            self.assertTrue(os.path.basename(stage).startswith(drive.STAGING_PREFIX))
+            if os.name == "posix":
+                self.assertEqual(os.stat(stage).st_mode & 0o777, 0o700)
+            return real(source, destination)
+
+        backend = create_backend(self.config, "drive", run=self.world, hosts=self.hosts)
+        with mock.patch.object(drive.shutil, "copyfile", side_effect=record):
+            for data in (b"one", b"two"):
+                backend.replace_bytes("reviews/INDEX.md", data, "text/markdown",
+                                      hashlib.sha256(data).hexdigest())
+        self.assertEqual(len(set(seen)), 2)
+        self.assertFalse(any(os.path.exists(stage) for stage in seen))
 
     def test_ssh_drive_root_with_tilde_lists_and_resolves(self):
         self.world.home = self.root.as_posix()

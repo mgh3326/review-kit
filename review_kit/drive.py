@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import subprocess  # nosec B404 -- argv lists only, never shell=True
+import tempfile
 
 
 UPLOADED = "uploaded"
@@ -184,19 +185,23 @@ def load_hosts(path=None):
     if not isinstance(hosts, dict) or not isinstance(local, dict):
         raise ValueError("hosts.toml: [hosts.<name>] and [local] must be tables")
     if "local" in hosts:
-        raise ValueError("hosts.toml: [hosts.local] is reserved (--host local is this "
-                         "machine); put its settings under [local] or rename the host")
+        raise ValueError("hosts.toml: [hosts.local] is reserved (--host local is the default "
+                         "host: [local], or the profile's DRIVE_MOUNT_DIR); put its settings "
+                         "under [local] or rename the host")
     return {"local": local, "hosts": hosts, "_path": str(path)}
 
 
 # --- hosts --------------------------------------------------------------------
 
-# A copy in progress: hidden (walks skip dotfiles) and next to its target.
-PARTIAL_NAME = ".%s.review-kit-partial"
-# ssh form of LocalHost.put_file: write a hidden sibling, rename on success.
-SSH_WRITE_SCRIPT = ('partial="$(dirname "$1")/.$(basename "$1").review-kit-partial"; '
-                    'cat > "$partial" && mv -f "$partial" "$1" || '
-                    '{ rm -f "$partial"; exit 1; }')
+# A copy in progress lives in a fresh private (0700) directory beside its target:
+# created exclusively under a unique name, so no planted symlink is followed and two
+# copies never share it; hidden, so walks skip it; same filesystem, so the rename is
+# atomic. Only the directory this copy created is removed.
+STAGING_PREFIX = ".review-kit-partial."
+# ssh form of LocalHost.put_file.
+SSH_WRITE_SCRIPT = ('[ ! -d "$1" ] || exit 1; stage=$(mktemp -d "$(dirname "$1")/' + STAGING_PREFIX + 'XXXXXX") || exit 1; '
+                    'cat > "$stage/data" && mv -f "$stage/data" "$1"; '
+                    'status=$?; rm -rf "$stage"; exit $status')
 
 
 class LocalHost:
@@ -263,17 +268,16 @@ class LocalHost:
         return self.drive_root
 
     def put_file(self, source, target):
-        # Written beside the target and renamed, so a failed copy leaves no partial file.
+        # Staged and renamed (STAGING_PREFIX), so a failed copy leaves no partial file.
         target = Path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
-        partial = target.with_name(PARTIAL_NAME % target.name)
+        stage = tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=str(target.parent))
         try:
-            shutil.copyfile(str(source), str(partial))
-            os.replace(str(partial), str(target))
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(str(partial))
-            raise
+            partial = os.path.join(stage, "data")
+            shutil.copyfile(str(source), partial)
+            os.replace(partial, str(target))
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
 
     def exists(self, path):
         return os.path.lexists(path)

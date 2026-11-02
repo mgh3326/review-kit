@@ -153,7 +153,7 @@ review-kit --profile work share ./clip.mp4 reviews/2026-11 --host drive-mac   # 
 2. **dropbox**: 시간 초과나 복사 실패 시 rclone(`copyto`, `link`)으로 `DROPBOX_REMOTE`에 `share upload`합니다. `route: dropbox`와 INDEX 링크를 출력합니다.
 3. **supabase / s3**: Dropbox도 실패하면 스토리지 저장소에 서명 링크로 `share upload`합니다. 저장소는 전역 `--backend`, 없으면 프로필의 `BACKEND`, 없으면 `supabase`입니다. `route: supabase`(또는 `s3`)와 INDEX 링크를 출력합니다. 경로마다 한 번만 시도하므로, `BACKEND=dropbox`(또는 `drive`)이면 스토리지 단계가 없습니다.
 
-`share`는 Drive 파일을 덮어쓰지 않습니다. `drive-dest` 아래 파일에 이미 다른 내용이 있으면 아무것도 복사하기 전에 멈추고, 다음 경로로 넘어가지도 않습니다. 다른 `drive-dest`를 고르거나 기존 파일을 옮기세요. SHA256이 같은 파일은 그대로 둡니다. 파일은 대상 옆에 숨김 이름으로 쓴 뒤 다 쓰면 이름을 바꾸므로, 복사가 실패해도 재시도를 막는 반쪽 파일이 남지 않습니다. Drive 루트 아래 경로 중간에 심볼릭 링크가 있어도 거부하므로, 복사본이 Drive 밖에 생기지 않습니다. Dropbox 업로드도 기존 키에 다른 내용이 있으면 같은 방식으로 거부합니다. `resign`은 `INDEX.md`와 매니페스트를 그대로 다시 씁니다.
+`share`는 Drive 파일을 덮어쓰지 않습니다. `drive-dest` 아래 파일에 이미 다른 내용이 있으면 아무것도 복사하기 전에 멈추고, 다음 경로로 넘어가지도 않습니다. 다른 `drive-dest`를 고르거나 기존 파일을 옮기세요. SHA256이 같은 파일은 그대로 둡니다. 파일은 대상 옆에 새로 만든 비공개 숨김 폴더에 쓴 뒤 다 쓰면 제자리로 옮기므로, 복사가 실패해도 재시도를 막는 반쪽 파일이 남지 않습니다. Drive 루트 아래 경로 중간에 심볼릭 링크가 있어도 거부하므로, 복사본이 Drive 밖에 생기지 않습니다. Dropbox 업로드도 기존 키에 다른 내용이 있으면 같은 방식으로 거부합니다. `resign`은 `INDEX.md`와 매니페스트를 그대로 다시 씁니다.
 
 rclone이 `path/insufficient_space`를 보고하면, note에 Dropbox 용량 부족과 `rclone about` 사용량, 그리고 `share-gc --apply`가 지울 Dropbox 패키지 목록을 출력합니다. 아무것도 삭제하지 않고 스토리지 단계로 넘어갑니다.
 
@@ -182,7 +182,7 @@ drive_root = "/Users/you/Library/CloudStorage/GoogleDrive-<account>/My Drive"
 # fileproviderctl = "/usr/bin/fileproviderctl"   # 선택
 ```
 
-`ssh`는 `BatchMode=yes`로 실행하므로 키 인증을 먼저 설정해야 합니다. 마운트 호스트에는 `fileproviderctl`, `shasum`, `rsync`가 필요하며 모두 macOS 기본 도구입니다. 원격 `drive_root`는 `~`로 시작할 수 있으며, 원격 `$HOME`을 뜻합니다. `local`은 이 컴퓨터용 예약어(`[local]`, `--host local`)이므로 `[hosts.local]`은 거부합니다.
+`ssh`는 `BatchMode=yes`로 실행하므로 키 인증을 먼저 설정해야 합니다. 마운트 호스트에는 `fileproviderctl`, `shasum`, `rsync`가 필요하며 모두 macOS 기본 도구입니다. 원격 `drive_root`는 `~`로 시작할 수 있으며, 원격 `$HOME`을 뜻합니다. `local`은 기본 호스트용 예약어이므로 `[hosts.local]`은 거부합니다. `--host local`(또는 `--host` 생략)은 이 컴퓨터의 `[local]`을 쓰고, 프로필에 `DRIVE_MOUNT_DIR`가 있으면 그 값을 씁니다. 그 값은 ssh 대상일 수도 있습니다(아래).
 
 예전 `deliver` 명령처럼 `DRIVE_MOUNT_DIR`를 설정한 프로필은 `hosts.toml` 없이도 그대로 동작합니다. `--host`를 지정하지 않으면 `DRIVE_MOUNT_DIR`가 Drive 루트가 되며 `[local]`보다 우선합니다. 값은 로컬 경로이거나 ssh 대상(`[user@]host:/path`)일 수 있습니다. `drive-dest`는 생략할 수 있어서, `review-kit --profile work share ./pa-review-123`은 `deliver`처럼 `DRIVE_MOUNT_DIR/pa-review-123`에 복사합니다. `DROPBOX_REMOTE`, `BACKEND`, `SUPABASE_BUCKET`, `SUPABASE_ENV_FILE`, `MIRO_ENV_FILE`도 전과 같이 읽습니다.
 
