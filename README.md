@@ -180,7 +180,7 @@ The routes are backends of the same share code, tried in this order:
 2. **dropbox**: on timeout or copy failure, `share upload` to `DROPBOX_REMOTE` with rclone (`copyto`, `link`). It prints `route: dropbox` and the INDEX link.
 3. **supabase / s3**: when Dropbox fails, `share upload` to the storage backend with signed links: the global `--backend`, else the profile's `BACKEND`, else `supabase`. It prints `route: supabase` (or `s3`) and the INDEX link. Each route is tried once: with `BACKEND=dropbox` (or `drive`) there is no storage step.
 
-`share` never overwrites a Drive file. When a file under `drive-dest` already holds other bytes, it stops before copying anything and does not fall back; choose another `drive-dest` or move the old file. A file with the same SHA256 is left as it is. A symbolic link anywhere below the Drive root on the way to a file is refused too, so a copy cannot land outside Drive. Dropbox uploads refuse other bytes under an existing key in the same way; `resign` still rewrites `INDEX.md` and the manifest in place.
+`share` never overwrites a Drive file. When a file under `drive-dest` already holds other bytes, it stops before copying anything and does not fall back; choose another `drive-dest` or move the old file. A file with the same SHA256 is left as it is. Each file is written beside its target under a hidden name and renamed when complete, so a failed copy leaves no partial file to block a retry. A symbolic link anywhere below the Drive root on the way to a file is refused too, so a copy cannot land outside Drive. Dropbox uploads refuse other bytes under an existing key in the same way; `resign` still rewrites `INDEX.md` and the manifest in place.
 
 When rclone reports `path/insufficient_space`, the note says Dropbox is full, gives the `rclone about` usage, and lists the Dropbox packages that `share-gc --apply` would remove. Nothing is deleted; `share` goes on to the storage step.
 
@@ -209,7 +209,7 @@ drive_root = "/Users/you/Library/CloudStorage/GoogleDrive-<account>/My Drive"
 # fileproviderctl = "/usr/bin/fileproviderctl"   # optional
 ```
 
-`ssh` runs with `BatchMode=yes`, so set up key authentication first. The mount host needs `fileproviderctl`, `shasum` and `rsync` (all ship with macOS).
+`ssh` runs with `BatchMode=yes`, so set up key authentication first. The mount host needs `fileproviderctl`, `shasum` and `rsync` (all ship with macOS). A remote `drive_root` may start with `~`; it is the remote `$HOME`. `local` is reserved for this machine (`[local]`, `--host local`), so `[hosts.local]` is refused.
 
 A profile that already sets `DRIVE_MOUNT_DIR` (as the earlier `deliver` command used it) keeps working without `hosts.toml`. When `--host` is not given, `DRIVE_MOUNT_DIR` is the Drive root and takes precedence over `[local]`. It may be a local path or an ssh target `[user@]host:/path`. `drive-dest` is optional, so `review-kit --profile work share ./pa-review-123` copies to `DRIVE_MOUNT_DIR/pa-review-123`, like `deliver` did. `DROPBOX_REMOTE`, `BACKEND`, `SUPABASE_BUCKET`, `SUPABASE_ENV_FILE` and `MIRO_ENV_FILE` are read as before.
 
