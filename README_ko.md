@@ -107,7 +107,7 @@ review-kit resign pa-review-123         # 파일 재업로드 없이 링크와 I
 review-kit done pa-review-123           # 검수 종료 후 명시적으로 삭제
 ```
 
-`--backend supabase|s3`는 저장소를 조회하거나 관리하는 명령의 전역 옵션입니다. 명령 앞에 둡니다(`review-kit --backend s3 done pa-review-123`). `share upload`은 prefix 뒤에 두는 기존 위치도 지원합니다. 삭제와 재서명은 실행 전 원장의 저장소 종류를 확인합니다. 용량 정리는 선택한 저장소에 기록된 패키지만 대상으로 하며, backend 필드가 없는 기존 원장 기록은 현재 선택한 저장소로 처리합니다.
+`--backend supabase|s3|dropbox|drive`는 저장소를 조회하거나 관리하는 명령의 전역 옵션입니다. 명령 앞에 둡니다(`review-kit --backend s3 done pa-review-123`). `share upload`은 prefix 뒤에 두는 기존 위치도 지원합니다. 삭제와 재서명은 실행 전 원장의 저장소 종류를 확인합니다. 용량 정리는 선택한 저장소에 기록된 패키지만 대상으로 하며, backend 필드가 없는 기존 원장 기록은 현재 선택한 저장소로 처리합니다.
 
 보관 기준은 링크 만료가 아니라 저장소 용량입니다. `prune`은 전체 사용량이 high-water 이하일 때는 삭제하지 않습니다. 초과하면 업로드가 가장 오래된 추적 패키지부터 low-water까지 지웁니다. 기본값은 1 GB 버킷 기준 **high 900 MB / low 700 MB**(십진 MB)입니다. 프로필의 `PRUNE_HIGH_WATER_MB`, `PRUNE_LOW_WATER_MB`로 설정하며 `prune --high-water-mb`와 `--low-water-mb`로 명령별 재정의도 가능합니다. `share upload`도 업로드 전에 같은 용량 정리를 실행합니다.
 
@@ -126,7 +126,7 @@ review-kit done pa-review-123           # 검수 종료 후 명시적으로 삭�
             "source": "storage", "url": "<서명 링크 또는 Drive 링크>"}]}
 ```
 
-`--version`(기본 `1`)과 `--issue`(기본 `null`)는 한 줄짜리 자유 문자열입니다. 예: `review-kit share upload ./review-package pa-review-123 --issue <ISSUE_ID> --version 2`. `INDEX.md`와 `MANIFEST.json`은 자동 생성되므로 입력 폴더에 같은 이름의 파일이 있으면 안 되고, 두 파일은 목록에 들어가지 않습니다.
+`--version`(기본 `1`)과 `--issue`(기본 `null`)는 한 줄짜리 자유 문자열입니다. 예: `review-kit share upload ./review-package pa-review-123 --issue <ISSUE_ID> --version 2`. `INDEX.md`와 `MANIFEST.json`은 자동 생성되므로 입력 폴더에 `INDEX.md`, `MANIFEST.review-kit.json`, review-kit 스키마의 `MANIFEST.json`이 있으면 안 되고, 두 파일은 목록에 들어가지 않습니다. 패키지에 다른 스키마의 자체 `MANIFEST.json`이 있으면 그대로 둡니다. 그 파일은 일반 파일로 업로드·목록에 포함되고, review-kit 매니페스트는 옆에 `MANIFEST.review-kit.json`으로 씁니다(`verify`에는 이 경로를 넘기세요).
 
 **매니페스트는 INDEX.md와 같은 비공개 자료입니다.** 같은 서명 링크가 들어 있으므로, 가진 사람은 링크가 만료될 때까지 목록의 파일을 읽을 수 있습니다.
 
@@ -136,49 +136,85 @@ review-kit done pa-review-123           # 검수 종료 후 명시적으로 삭�
 review-kit verify ./downloaded-package ./MANIFEST.json
 ```
 
-목록의 모든 파일의 크기와 SHA256을 비교하고, `MISSING`·`MISMATCH`·`EXTRA` 줄과 개수를 출력하며, 문제가 하나라도 있으면 0이 아닌 코드로 종료합니다. 폴더 안의 `INDEX.md`와 `MANIFEST.json`은 extra로 세지 않습니다. 프로필이나 네트워크가 필요 없습니다.
+목록의 모든 파일의 크기와 SHA256을 비교하고, `MISSING`·`MISMATCH`·`EXTRA` 줄과 개수를 출력하며, 문제가 하나라도 있으면 0이 아닌 코드로 종료합니다. 폴더 안의 `INDEX.md`, `MANIFEST.json`, `MANIFEST.review-kit.json`은 extra로 세지 않습니다. 프로필이나 네트워크가 필요 없습니다.
 
-### deliver: Drive 복사 → Dropbox → 스토리지 대체
+### share: Google Drive 업로드 확인 후 공유
 
-`deliver`는 검수자가 Drive → Dropbox → 스토리지 순서로 확인하는 경우의 수작업 절차를 한 명령으로 만든 것입니다.
+Drive for desktop은 복사한 파일을 바로 보여주지만, 실제 업로드는 아직 진행 중일 수 있습니다. `share`는 Drive 마운트에 복사한 뒤 macOS File Provider(`fileproviderctl evaluate`)로 모든 파일의 업로드 완료 여부를 확인합니다. 정해진 시간 안에 끝나지 않으면 다음 경로로 넘어갑니다.
 
 ```bash
-review-kit --profile work deliver ./review-package pa-review-123
+review-kit --profile work share ./pa-review-123 reviews/2026-11 --wait 10m
+review-kit --profile work share ./clip.mp4 reviews/2026-11 --host drive-mac   # ssh/rsync로 다른 Mac에 복사
 ```
 
-1. 패키지를 `DRIVE_MOUNT_DIR/<이름>/`에 복사합니다. Drive for desktop 마운트의 로컬 경로이거나 `host:/path` 같은 ssh 대상이 될 수 있습니다(각 파일을 `ssh`로 스트리밍하며 추가 도구가 필요 없습니다). 복사본은 `MANIFEST.json`의 바이트 크기와 SHA256으로 검증합니다. 매니페스트가 없으면 공유 manifest 코드로 생성해 복사본 옆에 둡니다.
-2. `DROPBOX_REMOTE/<이름>`에 `rclone copy`로 업로드하고 `rclone check`와 `rclone size`로 검증한 뒤 `rclone link`로 공유 링크를 만듭니다.
-3. Dropbox 단계가 실패한 경우에만 설정된 Supabase/S3 백엔드(`share upload`와 같은 서명 링크 방식)로 대체 업로드합니다.
+각 경로는 같은 공유 코드의 저장소(backend)이며, 다음 순서로 시도합니다.
 
-명령은 패키지 안에 작은 `DELIVERY.json`을 쓰고, Drive 경로·Dropbox 링크(또는 스토리지 INDEX 링크)·파일 수·바이트 합·매니페스트 SHA256이 담긴 Markdown 스니펫을 출력합니다. 검수 요청에 그대로 붙여 넣으면 됩니다. `DELIVERY.json`은 자동 생성 파일이므로 복사·계수 대상이 아닙니다.
+1. **drive**: `<drive_root>/<drive-dest>/<src 이름>`에 복사합니다. 이후 `--interval`(15초)마다 확인하며, 모든 파일이 `isUploaded = 1`, `isUploading = 0`이 될 때까지 최대 `--wait`(10분) 기다립니다. 성공하면 `route: drive`와 Drive 경로를 출력합니다.
+2. **dropbox**: 시간 초과나 복사 실패 시 rclone(`copyto`, `link`)으로 `DROPBOX_REMOTE`에 `share upload`합니다. `route: dropbox`와 INDEX 링크를 출력합니다.
+3. **supabase / s3**: Dropbox도 실패하면 스토리지 저장소에 서명 링크로 `share upload`합니다. 저장소는 전역 `--backend`, 없으면 프로필의 `BACKEND`, 없으면 `supabase`입니다. `route: supabase`(또는 `s3`)와 INDEX 링크를 출력합니다. 경로마다 한 번만 시도하므로, `BACKEND=dropbox`(또는 `drive`)이면 스토리지 단계가 없습니다.
 
-플래그: `--no-dropbox`는 Drive 마운트에만 복사하고, `--force-supabase`는 Dropbox를 건너뛰고 스토리지로 바로 업로드하며, `--dry-run`은 복사·업로드 없이 계획만 출력합니다. 기본 리모트는 없습니다. `deliver`에는 프로필의 `DRIVE_MOUNT_DIR`와 (플래그로 생략하지 않는 한) `DROPBOX_REMOTE`가 필요합니다.
+`share`는 Drive 파일을 덮어쓰지 않습니다. `drive-dest` 아래 파일에 이미 다른 내용이 있으면 아무것도 복사하기 전에 멈추고, 다음 경로로 넘어가지도 않습니다. 다른 `drive-dest`를 고르거나 기존 파일을 옮기세요. SHA256이 같은 파일은 그대로 둡니다. Drive 루트 아래 경로 중간에 심볼릭 링크가 있어도 거부하므로, 복사본이 Drive 밖에 생기지 않습니다. Dropbox 업로드도 기존 키에 다른 내용이 있으면 같은 방식으로 거부합니다. `resign`은 `INDEX.md`와 매니페스트를 그대로 다시 씁니다.
+
+rclone이 `path/insufficient_space`를 보고하면, note에 Dropbox 용량 부족과 `rclone about` 사용량, 그리고 `share-gc --apply`가 지울 Dropbox 패키지 목록을 출력합니다. 아무것도 삭제하지 않고 스토리지 단계로 넘어갑니다.
+
+어느 경로든 성공하면 종료 코드는 0입니다. 다음 경로로 넘어간 이유는 stderr에 `note: ...`로 출력합니다. Dropbox·스토리지 패키지는 파일별 Drive 경로와 함께 프로필 원장에 기록됩니다. 그래서 `status`, `done`, `prune`, `resign`, `ls`를 그대로 쓸 수 있고, 모든 명령에 `--backend dropbox`(또는 `drive`)를 지정할 수 있습니다. rclone 공유 링크는 만료되지 않으므로, Dropbox의 INDEX 만료일은 검토 기간 표시일 뿐입니다. 점(.)으로 시작하는 파일(`.DS_Store` 등)과 숨김 폴더(`.git/` 등)는 공유하거나 목록에 넣지 않습니다.
+
+#### 업로드 상태 확인
+
+```bash
+review-kit drive-status ~/Library/CloudStorage/GoogleDrive-*/My\ Drive/reviews/pa-review-123
+review-kit drive-status --host drive-mac --json reviews/pa-review-123
+```
+
+파일마다 `uploaded`, `uploading`, `not-uploaded`, `unknown` 중 하나를 출력합니다. `unknown`은 파일이 없거나, `fileproviderctl`이 없거나, 호스트에 접속할 수 없는 경우 등입니다. 모든 파일이 업로드되었을 때만 종료 코드가 0입니다. 폴더는 안의 파일로 펼칩니다. 로컬 경로는 현재 디렉터리 기준이고, `--host`를 쓰면 상대 경로는 그 호스트의 `drive_root` 기준입니다.
+
+#### 호스트 설정
+
+호스트 이름, ssh 대상, Drive 루트는 저장소가 아니라 `~/.config/review-kit/hosts.toml`(또는 `$REVIEW_KIT_CONFIG_DIR/hosts.toml`)에서 읽습니다.
+
+```toml
+[local]                      # 이 Mac
+drive_root = "~/Library/CloudStorage/GoogleDrive-<account>/My Drive"
+
+[hosts.drive-mac]            # Drive를 마운트한 다른 Mac (ssh 접속)
+ssh = "you@drive-mac.local"
+drive_root = "/Users/you/Library/CloudStorage/GoogleDrive-<account>/My Drive"
+# fileproviderctl = "/usr/bin/fileproviderctl"   # 선택
+```
+
+`ssh`는 `BatchMode=yes`로 실행하므로 키 인증을 먼저 설정해야 합니다. 마운트 호스트에는 `fileproviderctl`, `shasum`, `rsync`가 필요하며 모두 macOS 기본 도구입니다.
+
+예전 `deliver` 명령처럼 `DRIVE_MOUNT_DIR`를 설정한 프로필은 `hosts.toml` 없이도 그대로 동작합니다. `--host`를 지정하지 않으면 `DRIVE_MOUNT_DIR`가 Drive 루트가 되며 `[local]`보다 우선합니다. 값은 로컬 경로이거나 ssh 대상(`[user@]host:/path`)일 수 있습니다. `drive-dest`는 생략할 수 있어서, `review-kit --profile work share ./pa-review-123`은 `deliver`처럼 `DRIVE_MOUNT_DIR/pa-review-123`에 복사합니다. `DROPBOX_REMOTE`, `BACKEND`, `SUPABASE_BUCKET`, `SUPABASE_ENV_FILE`, `MIRO_ENV_FILE`도 전과 같이 읽습니다.
+
+#### share-gc
+
+```bash
+review-kit --profile work share-gc            # 시험 실행: 지울 대상만 출력
+review-kit --profile work share-gc --apply    # 삭제하고 로그에 기록
+```
+
+`share-gc`는 패키지의 모든 파일이 Drive에 업로드되었고 SHA256이 기록과 같을 때만 그 Dropbox·Supabase/S3 패키지를 삭제합니다. Drive 파일이 아직 업로드 중이거나, 수정되었거나, 없거나, 호스트에 접속할 수 없으면 사본을 유지합니다. 그다음 용량 기준을 넘은 대체 저장소를 오래된 순서로 정리합니다(`prune` 규칙). 기준은 `PRUNE_HIGH_WATER_MB`/`PRUNE_LOW_WATER_MB`이고, Dropbox는 `DROPBOX_HIGH_WATER_MB`/`DROPBOX_LOW_WATER_MB`를 따로 지정할 수 있습니다. Drive 자체는 정리하지 않습니다. `--apply`를 쓰면 삭제할 때마다 `~/.local/state/review-kit/share-gc.log`에 JSON 한 줄을 추가합니다(`SHARE_GC_LOG`로 위치 변경). 삭제에 실패하면 종료 코드는 1입니다. 그 컴퓨터의 원장을 읽으므로 `share`를 실행한 컴퓨터에서 실행하세요.
 
 ```ini
-DRIVE_MOUNT_DIR=/path/to/Drive-mount/reviews
-# 또는 ssh 대상: DRIVE_MOUNT_DIR=host:/path/to/drive/reviews
-DROPBOX_REMOTE=dropbox:Project/review
-# 선택: Drive 업로드가 클라우드에 보일 때 yes/no를 출력하는 명령
-DRIVE_CHECK_CMD=/path/to/drive-visible.sh
+# 프로필 추가 설정
+DROPBOX_REMOTE=dropbox:review-share
+# 선택: Dropbox 용량 기준(MB). 없으면 PRUNE_* 기준을 씁니다.
+DROPBOX_HIGH_WATER_MB=1500
+DROPBOX_LOW_WATER_MB=1200
 ```
 
-`rclone`과 `ssh`가 `PATH`에 있어야 하며 rclone에는 Dropbox 리모트가 설정되어 있어야 합니다. 전달 이름은 영문·숫자·점·밑줄·대시와 선택적 `/` 중첩을 허용합니다.
+`import-ledger <file.json>`은 프로필 원장으로 한 번만 실행하는 이전 도구입니다.
 
-Drive 마운트에 복사되면 Drive for desktop의 클라우드 업로드가 백그라운드에서 계속 진행 중이어도 전달된 것으로 간주합니다. 클라우드에 실제로 보이는지는 `drive-visible`이 플러그형 검사로 확인합니다. `DRIVE_CHECK_CMD`에 `yes` 또는 `no`를 출력하는 명령을 지정하세요(환경 변수 `REVIEW_KIT_DRIVE_NAME`과 `REVIEW_KIT_DRIVE_PATH`를 받습니다). 훅이 없으면 `unknown`입니다.
+- 예전 dots-share 평면 원장(`{prefix: {uploaded, expires, bytes}}`): 패키지를 선택한 저장소(`--backend` 또는 `BACKEND`) 아래에서 추적합니다.
+- 삭제된 `deliver` 명령의 `deliveries.json`(`~/.local/state/review-kit/deliveries.json`): 남아 있는 Dropbox 사본을 프로필의 `DROPBOX_REMOTE` 기준으로 `dropbox` 아래에서 추적합니다. 스토리지 사본은 이미 원장에 있습니다.
+
+이 패키지들은 객체 키가 기록되지 않았으므로 `done`과 `prune`이 prefix로 목록을 조회해 처리합니다.
 
 ```bash
-review-kit --profile work drive-visible pa-review-123   # yes, no 또는 unknown 출력
+review-kit --profile work import-ledger ~/.local/state/review-kit/deliveries.json
 ```
 
-Drive에 보이게 되면 임시 Dropbox 복사본과 스토리지 패키지를 삭제합니다.
-
-```bash
-review-kit --profile work cleanup pa-review-123 --dry-run
-review-kit --profile work cleanup pa-review-123                     # 먼저 Drive 확인 실행
-review-kit --profile work cleanup pa-review-123 --drive-confirmed   # 직접 확인한 경우
-```
-
-`cleanup`은 검사 결과가 `no`나 `unknown`이면 `--drive-confirmed` 없이는 실행을 거부합니다. Dropbox 삭제는 보호되어 있습니다. `DROPBOX_REMOTE` 아래의 기록된 리모트 경로만 `rclone purge`로 지우고, 스토리지에서는 원장에 추적된 객체만(`done` 규칙) 삭제합니다. 모든 전달은 `~/.local/state/review-kit/deliveries.json`에 기록되며(`DELIVERIES_PATH`로 이동 가능), `review-kit deliveries`가 아직 정리를 기다리는 전달을 보여주고 `--all`은 전부를 보여줍니다.
+이 기능은 예전 `deliver`, `cleanup`, `drive-visible`, `deliveries` 명령을 대체합니다. 대신 `share`, `share-gc`, `drive-status`, `status`를 쓰세요.
 
 ### board: Miro 와이어플로 배치
 
@@ -335,12 +371,14 @@ python3 prep_video.py recording.mp4 --min-vkbps 2500 --vkbps 5000
 ## 테스트
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py && python3 test_review_kit.py
+PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py && python3 test_review_kit.py && python3 test_drive_share.py
 ```
 
 설치된 FFmpeg로 0.017~1.4초 합성 영상을 생성합니다. 실제 기기 녹음이 아니며 생성 오디오는 테스트에서 `reconstructed`로 표기합니다. 음성/무음·홀수 크기·세로·회전 90·전체/제한/미지정 색 범위(흑/백 픽셀 값 ±3 검사)·수정 전 전체 범위 실패 재현·HDR 거부·색 태그 충돌·필터 부재·초단편·십진/이진 바이트 제한·입력 오류·도구 부재·출력 충돌·손상/시간 초과·검증 실패·재시도 상한/복구를 검사합니다. 재시도 크기 초과·디코딩 실패·시간 초과는 결정적인 검증을 위해 일부 함수를 모의 처리하며, 정상 변환·디코딩·크기/해시 검사는 실제 도구를 사용합니다. 결과는 `test_artifacts/test_results.json`, 로그와 합성 산출물로 남습니다. 원본 실영상 전체를 인코딩하지 않습니다.
 
 `test_review_kit.py`는 네트워크 없이 가짜 저장소를 사용합니다. Drive/스토리지 혼합 INDEX, Drive 전용 패키지, 원장 정리, 용량 기준 오래된 순서의 prune, 파일 재업로드 없는 resign, 안전한 객체 키, AWS 공개 SigV4 서명을 검사합니다.
+
+`test_drive_share.py`는 가짜 `fileproviderctl`, `ssh`, `rsync`, `rclone` 실행기를 쓰며 실제 Drive 마운트가 필요 없습니다. 업로드 상태 해석, ssh를 통한 `--host`, Drive·Dropbox 저장소, Drive → Dropbox → 스토리지 대체 순서, `share-gc`의 시험 실행·SHA256 일치·용량 정리를 검사합니다.
 
 이 도구가 플랫폼의 영상 업로드·재생·모델의 영상 이해 능력을 보장하지는 않습니다. 짧은 조각, 원본 시간표, 선택 썸네일이 검토 근거를 추적하기 쉽게 만듭니다.
 

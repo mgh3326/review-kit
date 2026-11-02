@@ -3,10 +3,10 @@ import json
 import os
 from pathlib import Path
 
-from .share import MANIFEST_NAME, MANIFEST_SCHEMA, sha256_file
+from .share import MANIFEST_NAME, MANIFEST_SCHEMA, SIDECAR_MANIFEST_NAME, sha256_file
 
 # Generated listing files a reviewer downloads next to the package; never "extra".
-GENERATED_NAMES = ("INDEX.md", MANIFEST_NAME)
+GENERATED_NAMES = ("INDEX.md", MANIFEST_NAME, SIDECAR_MANIFEST_NAME)
 
 
 def load_manifest(path):

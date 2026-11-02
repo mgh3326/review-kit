@@ -5,15 +5,15 @@ import os
 from pathlib import Path
 import sys
 
-from .backends import create_backend
+from .backends import BACKENDS, create_backend
 from .board import (COMMENTS_UNAVAILABLE, inventory_board,
                     inventory_markdown, place_board)
 from .config import load_config
-from .deliver import (cleanup_package, deliver_package, deliveries_path,
-                      drive_visible, load_deliveries)
+from .drive import drive_status, load_hosts, make_host, summarize
 from .miro import MiroClient
 from .share import (DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES, done_package,
-                    package_status, prune_packages, resign_package, upload_folder)
+                    import_legacy_ledger, package_status, parse_duration, prune_packages,
+                    resign_package, share_gc, share_with_fallback, upload_folder)
 from .verify import verify_folder
 
 
@@ -35,25 +35,31 @@ def _parser():
     parser.add_argument("--profile", default=os.environ.get("REVIEW_KIT_PROFILE", "default"),
                         help="profile name under ~/.config/review-kit (or set REVIEW_KIT_PROFILE)")
     parser.add_argument("--config", help="explicit profile .env file")
-    parser.add_argument("--backend", choices=("supabase", "s3"),
+    parser.add_argument("--backend", choices=BACKENDS,
                         help="select a storage backend for this command")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    share = commands.add_parser("share", help="share review material")
-    share_commands = share.add_subparsers(dest="share_command", required=True)
-    upload = share_commands.add_parser("upload", help="upload files and create INDEX.md and MANIFEST.json")
-    upload.add_argument("directory", type=Path)
-    upload.add_argument("prefix")
-    upload.add_argument("--days", type=int, default=7)
-    # Keep the upload-local spelling from the original interface while also
-    # allowing the global option for cleanup and inspection commands.
-    upload.add_argument("--backend", dest="upload_backend", choices=("supabase", "s3"))
-    upload.add_argument("--drive-manifest", help="JSON mapping relative file paths to Drive URLs")
-    upload.add_argument("--drive-folder-url", "--drive-url", dest="drive_folder_url",
-                        help="folder-level Drive URL included at the top of INDEX.md")
-    upload.add_argument("--version", default="1",
-                        help="package version recorded in MANIFEST.json (default 1)")
-    upload.add_argument("--issue", help="issue id recorded in MANIFEST.json as issue_id")
+    # `share` has two forms (`share upload ...` and `share <src> <drive-dest>`), so its
+    # arguments are parsed by _share_upload_parser / _share_drive_parser in main().
+    commands.add_parser("share", add_help=False,
+                        help="share upload <dir> <prefix> | share <src> <drive-dest>")
+
+    status = commands.add_parser(
+        "drive-status", help="uploaded / uploading / not-uploaded per file via File Provider")
+    status.add_argument("paths", nargs="+", metavar="path")
+    status.add_argument("--host", help="check on this [hosts.<name>] from hosts.toml over ssh")
+    status.add_argument("--json", action="store_true")
+
+    gc = commands.add_parser(
+        "share-gc", help="delete Dropbox/storage share copies once Drive has the same bytes")
+    gc.add_argument("--apply", action="store_true",
+                    help="delete; without it the command only prints the plan")
+    gc.add_argument("--json", action="store_true")
+
+    legacy = commands.add_parser(
+        "import-ledger",
+        help="one-shot: track packages from a dots-share ledger or deliver's deliveries.json")
+    legacy.add_argument("legacy", type=Path, metavar="ledger.json")
 
     verify = commands.add_parser("verify", help="check a downloaded folder against MANIFEST.json")
     verify.add_argument("directory", type=Path)
@@ -71,35 +77,6 @@ def _parser():
     commands.add_parser("status", help="show storage use and tracked package expiry")
     listing = commands.add_parser("ls", help="list remote object keys")
     listing.add_argument("prefix", nargs="?", default="")
-
-    deliver = commands.add_parser(
-        "deliver", help="copy a package to Drive, then Dropbox, then storage as a fallback")
-    deliver.add_argument("directory", type=Path)
-    deliver.add_argument("name")
-    deliver.add_argument("--days", type=int, default=7,
-                         help="signed-link lifetime when the storage fallback is used")
-    fallback = deliver.add_mutually_exclusive_group()
-    fallback.add_argument("--no-dropbox", action="store_true",
-                          help="copy to the Drive mount only")
-    fallback.add_argument("--force-supabase", action="store_true",
-                          help="skip Dropbox and upload to the configured storage backend")
-    deliver.add_argument("--dry-run", action="store_true")
-
-    drive_check = commands.add_parser(
-        "drive-visible", help="report whether the Drive copy is visible in the cloud")
-    drive_check.add_argument("name")
-
-    cleanup = commands.add_parser(
-        "cleanup", help="delete the Dropbox and storage copies once Drive is visible")
-    cleanup.add_argument("name")
-    cleanup.add_argument("--drive-confirmed", action="store_true",
-                         help="skip the Drive visibility check")
-    cleanup.add_argument("--dry-run", action="store_true")
-
-    deliveries = commands.add_parser(
-        "deliveries", help="list deliveries still waiting for cleanup")
-    deliveries.add_argument("--all", action="store_true",
-                            help="include deliveries already cleaned up")
 
     board = commands.add_parser(
         "board", help="lay out review captures on a Miro board")
@@ -136,6 +113,112 @@ def _parser():
     return parser
 
 
+def _share_upload_parser():
+    upload = argparse.ArgumentParser(
+        prog="review-kit share upload",
+        description="upload files and create INDEX.md and MANIFEST.json")
+    upload.add_argument("directory", type=Path)
+    upload.add_argument("prefix")
+    upload.add_argument("--days", type=int, default=7)
+    # Keep the upload-local spelling from the original interface while also
+    # allowing the global option for cleanup and inspection commands.
+    upload.add_argument("--backend", dest="upload_backend", choices=BACKENDS)
+    upload.add_argument("--drive-manifest", help="JSON mapping relative file paths to Drive URLs")
+    upload.add_argument("--drive-folder-url", "--drive-url", dest="drive_folder_url",
+                        help="folder-level Drive URL included at the top of INDEX.md")
+    upload.add_argument("--version", default="1",
+                        help="package version recorded in MANIFEST.json (default 1)")
+    upload.add_argument("--issue", help="issue id recorded in MANIFEST.json as issue_id")
+    return upload
+
+
+def _share_drive_parser():
+    share = argparse.ArgumentParser(
+        prog="review-kit share",
+        description="Copy <src> into the Drive mount and wait until File Provider reports "
+                    "every file uploaded; on timeout fall back to Dropbox, then storage. "
+                    "(`review-kit share upload -h` shows the storage upload form.)")
+    share.add_argument("source", type=Path, metavar="src")
+    share.add_argument("drive_dest", metavar="drive-dest", nargs="?", default="",
+                       help="Drive folder: absolute, or relative to the Drive root "
+                            "(DRIVE_MOUNT_DIR or drive_root); default: the root itself")
+    share.add_argument("--host", help="mount host from hosts.toml; copy with rsync over ssh")
+    share.add_argument("--wait", default="10m", help="upload wait before falling back (10m)")
+    share.add_argument("--interval", default="15s", help="poll interval while waiting (15s)")
+    share.add_argument("--days", type=int, default=7,
+                       help="signed-link lifetime when the storage fallback is used")
+    return share
+
+
+def _print_status(result, as_json):
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    for item in result["files"]:
+        detail = ("\t" + item["detail"]) if item["detail"] else ""
+        print("%s\t%s%s" % (item["status"], item["path"], detail))
+    print("%s: %d file(s): %s" % (result["host"], len(result["files"]),
+                                  summarize(result["files"]) or "none"))
+
+
+def _run_drive_status(args):
+    config = load_config(args.profile, args.config)
+    host = make_host(load_hosts(), args.host, config=config)
+    paths = [host.resolve(path) for path in args.paths]
+    result = drive_status(host, paths)
+    _print_status(result, args.json)
+    return 0 if result["all_uploaded"] else 1
+
+
+def _run_share_drive(args, rest):
+    options = _share_drive_parser().parse_args(rest)
+    config = load_config(args.profile, args.config)
+    result = share_with_fallback(config, options.source, options.drive_dest,
+                                 host_name=options.host, wait=parse_duration(options.wait),
+                                 interval=parse_duration(options.interval), days=options.days,
+                                 backend_name=args.backend)
+    for error in result["errors"]:
+        print("note: %s" % error, file=sys.stderr)
+    print("route: %s" % result["route"])
+    if result["route"] == "drive":
+        print("drive: %s" % result["drive_path"])
+    else:
+        print("drive: %s (%s)" % (result["drive_path"], result.get("drive_status", "not uploaded")))
+        print("link: %s" % result["link"])
+    return 0
+
+
+def _run_share_gc(args):
+    config = load_config(args.profile, args.config)
+    result = share_gc(config, apply=args.apply)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        verb = "removed" if args.apply else "would remove"
+        for row in result["actions"]:
+            if row.get("error"):
+                print("FAILED %s %s %s: %s" % (row["backend"], row["prefix"] or "-",
+                                               row["reason"], row["error"]))
+            else:
+                print("%s %s %s (%s)" % (verb, row["backend"], row["prefix"], row["reason"]))
+        for row in result["kept"]:
+            print("kept %s %s (%s)" % (row["backend"], row["prefix"], row["reason"]))
+        if not result["actions"]:
+            print("Nothing to remove.")
+        elif not args.apply:
+            print("Dry run; nothing was deleted. Pass --apply to delete.")
+    return 1 if any(row.get("error") for row in result["actions"]) else 0
+
+
+def _run_import_ledger(args):
+    config = load_config(args.profile, args.config)
+    backend_name = (args.backend or config.get("BACKEND") or "supabase").lower()
+    added, skipped = import_legacy_ledger(config["_LEDGER_PATH"], args.legacy, backend_name,
+                                          dropbox_remote=config.get("DROPBOX_REMOTE"))
+    print("Imported %d package(s); %d already tracked" % (len(added), len(skipped)))
+    return 0
+
+
 def _backend_and_ledger(args):
     config = load_config(args.profile, args.config)
     selected = (getattr(args, "upload_backend", None) or
@@ -162,77 +245,6 @@ def _run_package(args):
     output = assemble_package(args.output, args.video, args.still, args.max_mb,
                               args.title, args.context, args.check)
     print("Package ready: %s" % output)
-
-
-def _run_deliveries(config, show_all):
-    state = load_deliveries(deliveries_path(config))
-    rows = [(name, entry) for name, entry in sorted(state["deliveries"].items())
-            if show_all or not entry.get("cleaned")]
-    if not rows:
-        print("No deliveries recorded" if show_all
-              else "No deliveries waiting for cleanup")
-        return
-    for name, entry in rows:
-        dropbox = entry.get("dropbox") or {}
-        storage = entry.get("storage") or {}
-        link = dropbox.get("link") or storage.get("index_url") or "-"
-        status = "cleaned" if entry.get("cleaned") else "pending"
-        print("%s\t%s\t%s\t%s\t%s" % (entry.get("delivered_utc", "?"), name, status,
-                                      entry.get("drive_path", "?"), link))
-
-
-def _run_deliver(config, args):
-    result = deliver_package(config, args.directory, args.name, days=args.days,
-                             no_dropbox=args.no_dropbox,
-                             force_supabase=args.force_supabase,
-                             dry_run=args.dry_run, backend_name=args.backend)
-    if result["dry_run"]:
-        for line in result["plan"]:
-            print(line)
-        print("Dry run; nothing was copied or uploaded.")
-        return
-    dropbox = result["delivery"].get("dropbox") or {}
-    if dropbox.get("error"):
-        print("Dropbox step failed; used the storage fallback instead.",
-              file=sys.stderr)
-    print(result["markdown"], end="")
-    print("Wrote %s" % result["delivery_path"])
-
-
-def _run_cleanup(config, args):
-    result = cleanup_package(config, args.name,
-                             drive_confirmed=args.drive_confirmed,
-                             dry_run=args.dry_run, backend_name=args.backend)
-    if result["dry_run"]:
-        for line in result["plan"]:
-            print("Would " + line)
-        if not result["plan"]:
-            print("Nothing to clean up for %s." % result["name"])
-        print("Dry run; nothing was deleted.")
-        return
-    for item in result["removed"]:
-        if item["kind"] == "dropbox":
-            print("Removed Dropbox copy at %s" % item["remote"])
-        else:
-            print("Deleted %d tracked storage objects for %s"
-                  % (item["objects"], item["prefix"]))
-    if not result["removed"]:
-        print("Nothing to clean up for %s." % result["name"])
-
-
-def _run_delivery_command(args):
-    config = load_config(args.profile, args.config)
-    if args.command == "drive-visible":
-        print(drive_visible(config, args.name))
-    elif args.command == "deliveries":
-        _run_deliveries(config, args.all)
-    elif args.command == "deliver":
-        _run_deliver(config, args)
-    elif args.command == "cleanup":
-        _run_cleanup(config, args)
-    else:
-        raise ValueError("unsupported command")
-    return 0
 
 
 def _board_place(client, config, args):
@@ -283,15 +295,29 @@ def _run_verify(args):
 
 def main(argv=None):
     parser = _parser()
-    args = parser.parse_args(argv)
+    args, rest = parser.parse_known_args(argv)
+    if args.command != "share" and rest:
+        parser.error("unrecognized arguments: %s" % " ".join(rest))
+    if args.command == "share" and rest[:1] == ["upload"]:
+        args.share_command = "upload"
+        for name, value in vars(_share_upload_parser().parse_args(rest[1:])).items():
+            setattr(args, name, value)
+    elif args.command == "share":
+        args.share_command = "drive"
     try:
+        if args.command == "share" and args.share_command == "drive":
+            return _run_share_drive(args, rest)
+        if args.command == "drive-status":
+            return _run_drive_status(args)
+        if args.command == "share-gc":
+            return _run_share_gc(args)
+        if args.command == "import-ledger":
+            return _run_import_ledger(args)
         if args.command == "package":
             _run_package(args)
             return 0
         if args.command == "verify":
             return _run_verify(args)
-        if args.command in ("deliver", "drive-visible", "cleanup", "deliveries"):
-            return _run_delivery_command(args)
         if args.command == "board":
             return _run_board_command(args)
         config, backend, ledger_path = _backend_and_ledger(args)
