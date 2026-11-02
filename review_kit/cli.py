@@ -175,7 +175,8 @@ def _run_share_drive(args, rest):
     config = load_config(args.profile, args.config)
     result = share_with_fallback(config, options.source, options.drive_dest,
                                  host_name=options.host, wait=parse_duration(options.wait),
-                                 interval=parse_duration(options.interval), days=options.days)
+                                 interval=parse_duration(options.interval), days=options.days,
+                                 backend_name=args.backend)
     for error in result["errors"]:
         print("note: %s" % error, file=sys.stderr)
     print("route: %s" % result["route"])

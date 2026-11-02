@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -42,6 +43,8 @@ class FakeWorld:
         self.calls = []
         self.dropbox = {}         # "remote:path/file" -> bytes
         self.dropbox_fails = False
+        self.dropbox_full = False
+        self.unreadable = set()   # remote paths shasum cannot read
         self.ssh_down = False
 
     def _evaluate(self, path):
@@ -76,10 +79,14 @@ class FakeWorld:
         if words[0] == "find":
             return self._find(words)
         if words[:2] == ["shasum", "-a"]:
+            if words[3] in self.unreadable:
+                return 1, b"", b"Permission denied"
             if not os.path.exists(words[3]):
                 return 1, b"", b"No such file"
             digest = hashlib.sha256(Path(words[3]).read_bytes()).hexdigest()
             return 0, ("%s  %s\n" % (digest, words[3])).encode(), b""
+        if words[0] == "test":
+            return (0 if os.path.lexists(words[2]) else 1), b"", b""
         if words[:2] == ["mkdir", "-p"]:
             Path(words[2]).mkdir(parents=True, exist_ok=True)
             return 0, b"", b""
@@ -106,6 +113,12 @@ class FakeWorld:
         if self.dropbox_fails:
             return 1, b"", b"simulated Dropbox outage"
         verb = args[0]
+        if verb == "about":
+            return 0, b'{"total": 2000000000, "used": 1999000000, "free": 1000000}', b""
+        if verb == "copyto" and self.dropbox_full:
+            # rclone prints a long error; the reason sits past the first 200 characters.
+            return 1, b"", (b"ERROR : " + b"x" * 300 +
+                            b": Failed to copy: upload failed: path/insufficient_space/..")
         if verb == "copyto":
             self.dropbox[args[2]] = Path(args[1]).read_bytes()
         elif verb == "link":
@@ -188,6 +201,7 @@ class Base(unittest.TestCase):
         self.temp.cleanup()
 
     def factory(self, config, name=None, **extra):
+        self.built = getattr(self, "built", []) + [name]
         if name in ("drive", "dropbox"):
             return create_backend(config, name, **extra)
         if self.backend is None:
@@ -438,6 +452,106 @@ class ShareTests(Base):
             result = self.share()
         self.assertEqual(result["route"], "dropbox")
         self.assertIn("disk full", result["errors"][0])
+
+    def test_existing_drive_file_with_other_bytes_stops_the_share(self):
+        # data.csv is copied before clips/a.mp4, so the conflict is on a later file.
+        target = self.drive_root / "reviews" / "pack" / "clips" / "a.mp4"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"an earlier review")
+        with self.assertRaisesRegex(ValueError, "Refusing to overwrite .*a.mp4"):
+            self.share()
+        self.assertEqual(target.read_bytes(), b"an earlier review")
+        # Checked before the first copy: nothing else was written, no fallback ran.
+        self.assertFalse((self.drive_root / "reviews" / "pack" / "data.csv").exists())
+        self.assertEqual(self.world.dropbox, {})
+        self.assertFalse(self.ledger.exists())
+
+    def test_existing_remote_drive_file_with_other_bytes_stops_the_share(self):
+        target = self.remote_root / "reviews" / "pack" / "data.csv"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"an earlier review")
+        with self.assertRaisesRegex(ValueError, "Refusing to overwrite"):
+            self.share(host_name="mount")
+        self.assertEqual(target.read_bytes(), b"an earlier review")
+        self.assertFalse(any(c[0] == "rsync" for c in self.world.calls))
+        # A file shasum cannot read is not "missing" either.
+        target.write_bytes(b"x,y\n1,2\n")
+        self.world.unreadable.add(target.as_posix())
+        with self.assertRaisesRegex(ValueError, "different or unreadable"):
+            self.share(host_name="mount")
+
+    def test_same_bytes_already_on_drive_are_not_copied_again(self):
+        first = self.share()
+        self.assertEqual(first["route"], "drive")
+        with mock.patch.object(drive.LocalHost, "put_file") as put:
+            self.assertEqual(self.share()["route"], "drive")
+        put.assert_not_called()
+
+    def test_fallback_routes_are_deduplicated_and_storage_only(self):
+        self.busy("pack", "data.csv")
+        self.world.dropbox_fails = True
+        self.config["BACKEND"] = "dropbox"
+        with self.assertRaisesRegex(RuntimeError, "No share route worked") as raised:
+            self.share()
+        self.assertEqual(self.built, ["drive", "dropbox"])
+        self.assertEqual(str(raised.exception).count("; dropbox: "), 1)
+        self.built = []
+        self.config["BACKEND"] = "drive"
+        with self.assertRaisesRegex(RuntimeError, "drive is not Supabase/S3"):
+            self.share()
+        self.assertEqual(self.built, ["drive", "dropbox"])
+
+    def test_backend_argument_wins_over_profile_backend(self):
+        self.busy("pack", "data.csv")
+        self.world.dropbox_fails = True
+        self.config["BACKEND"] = "supabase"
+        self.backend.name = "s3"
+        result = self.share(backend_name="s3")
+        self.assertEqual(result["route"], "s3")
+        self.assertEqual(self.built, ["drive", "dropbox", "s3"])
+
+    def test_cli_passes_global_backend_to_share(self):
+        fake = mock.Mock(return_value={"route": "drive", "drive_path": "/d/pack", "errors": []})
+        with mock.patch.object(cli, "share_with_fallback", fake), \
+                mock.patch.dict(os.environ, {"REVIEW_KIT_CONFIG_DIR": str(self.root)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["--backend", "s3", "share", str(self.source)]), 0)
+        self.assertEqual(fake.call_args.kwargs["backend_name"], "s3")
+
+    def test_full_dropbox_is_named_with_usage_and_cleanup_candidates(self):
+        # An earlier share sits on Dropbox and its Drive copy is now uploaded.
+        self.busy("pack", "data.csv")
+        earlier = self.share()
+        self.assertEqual(earlier["route"], "dropbox")
+        self.world.status.clear()
+        other = self.root / "other.mp4"
+        other.write_bytes(b"new clip")
+        self.world.status[str(self.drive_root / "reviews" / "other.mp4")] = ["uploading"]
+        self.world.dropbox_full = True
+        result = self.share(source=other)
+        self.assertEqual(result["route"], "supabase")
+        notes = "\n".join(result["errors"])
+        self.assertIn("Dropbox is full (rclone: path/insufficient_space)", notes)
+        self.assertIn("used 1999.0 MB of 2000.0 MB", notes)
+        self.assertIn("share-gc --apply would remove %s (Drive uploaded, sha256 match)"
+                      % earlier["prefix"], notes)
+        # Listing candidates deletes nothing.
+        self.assertIn("dropbox:review-share/%s/INDEX.md" % earlier["prefix"], self.world.dropbox)
+        self.assertEqual(self.world.ran("deletefile"), [])
+        self.assertFalse(self.log.exists())
+
+    def test_foreign_manifest_is_copied_to_drive_as_content(self):
+        foreign = b'{"schema": "other-tool/2"}\n'
+        (self.source / "MANIFEST.json").write_bytes(foreign)
+        self.assertEqual(self.share()["route"], "drive")
+        self.assertEqual((self.drive_root / "reviews" / "pack" / "MANIFEST.json").read_bytes(),
+                         foreign)
+
+    def test_default_run_stops_a_hung_command(self):
+        code, _, err = drive.default_run(
+            [sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5)
+        self.assertEqual(code, 124)
+        self.assertIn(b"timed out", err)
 
     def test_parse_duration(self):
         self.assertEqual(share.parse_duration("10m"), 600)

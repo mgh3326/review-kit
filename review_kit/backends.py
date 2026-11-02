@@ -483,10 +483,22 @@ class DriveBackend:
     def join_key(folder, relative):
         return readable_key(folder, relative) if folder else readable_key(relative)
 
-    def put_file(self, key, path, content_type, digest):
+    def already_there(self, key, digest):
+        """True when key holds digest, False when it is free; DriveConflict otherwise,
+        so an existing Drive file is never overwritten with other bytes."""
         target = self.path(key)
-        if self.host.sha256(target) == digest:
+        current = self.host.sha256(target)
+        if current == digest:
+            return True
+        if current is not None or self.host.exists(target):
+            raise DriveConflict("Refusing to overwrite %s: it holds different or unreadable "
+                                "bytes; choose another drive-dest or move it away" % target)
+        return False
+
+    def put_file(self, key, path, content_type, digest):
+        if self.already_there(key, digest):
             return False
+        target = self.path(key)
         self.host.put_file(path, target)
         if self.host.sha256(target) != digest:
             raise RuntimeError("Drive copy of %s does not match its sha256" % key)
@@ -525,6 +537,22 @@ class DriveBackend:
         return drive_status(self.host, [self.path(key) for key in keys], expand=False)
 
 
+def _text(data):
+    return (data or b"").decode("utf-8", "replace")
+
+
+def _megabytes(count):
+    return "%.1f MB" % (int(count) / 1e6)
+
+
+class DriveConflict(ValueError):
+    """The Drive destination already holds other bytes; no copy was made."""
+
+
+class DropboxFull(RuntimeError):
+    """rclone reported path/insufficient_space."""
+
+
 class DropboxBackend:
     """Dropbox through an rclone remote (DROPBOX_REMOTE=remote:folder).
 
@@ -546,10 +574,25 @@ class DropboxBackend:
         if code == 3 and missing_ok:  # rclone: directory not found
             return None
         if code:
-            detail = " ".join((err or b"").decode("utf-8", "replace").split())[:200]
+            text = " ".join((err or b"").decode("utf-8", "replace").split())
+            # Checked on the full stderr: the summary below cuts rclone's long errors.
+            if "insufficient_space" in text.lower():
+                raise DropboxFull("Dropbox is full (rclone: path/insufficient_space); %s; "
+                                  "`review-kit share-gc` lists copies that can go"
+                                  % self.usage())
             raise RuntimeError("rclone %s failed (exit %d)%s"
-                               % (args[0], code, ("; " + detail) if detail else ""))
+                               % (args[0], code, ("; " + text[:200]) if text else ""))
         return out
+
+    def usage(self):
+        """'used X of Y' from rclone about, or why it is unknown; never raises."""
+        root = self.remote.split(":", 1)[0] + ":"
+        code, out, _ = self.run(["rclone", "about", root, "--json"])
+        try:
+            about = json.loads(_text(out)) if code == 0 else None
+            return "used %s of %s" % (_megabytes(about["used"]), _megabytes(about["total"]))
+        except (ValueError, TypeError, KeyError):
+            return "usage unknown (rclone about %s failed)" % root
 
     def _path(self, key):
         return self.remote + "/" + key if key else self.remote

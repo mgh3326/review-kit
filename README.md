@@ -151,7 +151,7 @@ The ledger is JSON beside the selected profile by default (`<profile>.ledger.jso
             "source": "storage", "url": "<SIGNED_OR_DRIVE_LINK>"}]}
 ```
 
-`--version` (default `1`) and `--issue` (default `null`) are free-form single-line strings: `review-kit share upload ./review-package pa-review-123 --issue <ISSUE_ID> --version 2`. `INDEX.md` and `MANIFEST.json` are generated, so the input folder may not contain files with those names, and neither lists itself.
+`--version` (default `1`) and `--issue` (default `null`) are free-form single-line strings: `review-kit share upload ./review-package pa-review-123 --issue <ISSUE_ID> --version 2`. `INDEX.md` and `MANIFEST.json` are generated, so the input folder may not contain `INDEX.md`, `MANIFEST.review-kit.json`, or a `MANIFEST.json` in the review-kit schema, and neither lists itself. A package that ships its own `MANIFEST.json` in another schema keeps it: that file is uploaded and listed as ordinary content, and review-kit's manifest goes beside it as `MANIFEST.review-kit.json` (pass that path to `verify`).
 
 **The manifest is private material, like INDEX.md.** It carries the same signed links, so anyone who holds it can read the listed files until the links expire.
 
@@ -161,7 +161,7 @@ After downloading the files into a folder, the reviewer checks them with:
 review-kit verify ./downloaded-package ./MANIFEST.json
 ```
 
-It compares the size and SHA256 of every listed file, prints `MISSING`, `MISMATCH` and `EXTRA` lines plus their counts, and exits non-zero on any problem. `INDEX.md` and `MANIFEST.json` in the folder are not counted as extra. It needs no profile or network.
+It compares the size and SHA256 of every listed file, prints `MISSING`, `MISMATCH` and `EXTRA` lines plus their counts, and exits non-zero on any problem. `INDEX.md`, `MANIFEST.json` and `MANIFEST.review-kit.json` in the folder are not counted as extra. It needs no profile or network.
 
 Upload refuses to overwrite any existing storage key unless its recorded SHA256 matches. Use a fresh prefix for each package; run `done` to remove an active package before reusing its prefix.
 
@@ -178,7 +178,11 @@ The routes are backends of the same share code, tried in this order:
 
 1. **drive**: copy into `<drive_root>/<drive-dest>/<src name>`, then poll every `--interval` (15s) until every file reports `isUploaded = 1` and `isUploading = 0`, for at most `--wait` (10m). Success prints `route: drive` and the Drive path.
 2. **dropbox**: on timeout or copy failure, `share upload` to `DROPBOX_REMOTE` with rclone (`copyto`, `link`). It prints `route: dropbox` and the INDEX link.
-3. **supabase / s3**: when Dropbox fails, `share upload` to the profile's `BACKEND` with signed links. It prints `route: supabase` (or `s3`) and the INDEX link.
+3. **supabase / s3**: when Dropbox fails, `share upload` to the storage backend with signed links: the global `--backend`, else the profile's `BACKEND`, else `supabase`. It prints `route: supabase` (or `s3`) and the INDEX link. Each route is tried once: with `BACKEND=dropbox` (or `drive`) there is no storage step.
+
+`share` never overwrites a Drive file. When a file under `drive-dest` already holds other bytes, it stops before copying anything and does not fall back; choose another `drive-dest` or move the old file. A file with the same SHA256 is left as it is.
+
+When rclone reports `path/insufficient_space`, the note says Dropbox is full, gives the `rclone about` usage, and lists the Dropbox packages that `share-gc --apply` would remove. Nothing is deleted; `share` goes on to the storage step.
 
 Exit status is 0 when any route worked. The reason for each fallback goes to stderr as `note: ...`. Dropbox and storage packages are recorded in the profile ledger together with the Drive path of each file, so `status`, `done`, `prune`, `resign` and `ls` work on them, and `--backend dropbox` (or `drive`) works with every command. Rclone share links do not expire, so on Dropbox the INDEX expiry date is a review window only. Dotfiles (`.DS_Store` and similar) are never shared.
 

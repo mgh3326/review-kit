@@ -126,7 +126,7 @@ review-kit done pa-review-123           # 검수 종료 후 명시적으로 삭�
             "source": "storage", "url": "<서명 링크 또는 Drive 링크>"}]}
 ```
 
-`--version`(기본 `1`)과 `--issue`(기본 `null`)는 한 줄짜리 자유 문자열입니다. 예: `review-kit share upload ./review-package pa-review-123 --issue <ISSUE_ID> --version 2`. `INDEX.md`와 `MANIFEST.json`은 자동 생성되므로 입력 폴더에 같은 이름의 파일이 있으면 안 되고, 두 파일은 목록에 들어가지 않습니다.
+`--version`(기본 `1`)과 `--issue`(기본 `null`)는 한 줄짜리 자유 문자열입니다. 예: `review-kit share upload ./review-package pa-review-123 --issue <ISSUE_ID> --version 2`. `INDEX.md`와 `MANIFEST.json`은 자동 생성되므로 입력 폴더에 `INDEX.md`, `MANIFEST.review-kit.json`, review-kit 스키마의 `MANIFEST.json`이 있으면 안 되고, 두 파일은 목록에 들어가지 않습니다. 패키지에 다른 스키마의 자체 `MANIFEST.json`이 있으면 그대로 둡니다. 그 파일은 일반 파일로 업로드·목록에 포함되고, review-kit 매니페스트는 옆에 `MANIFEST.review-kit.json`으로 씁니다(`verify`에는 이 경로를 넘기세요).
 
 **매니페스트는 INDEX.md와 같은 비공개 자료입니다.** 같은 서명 링크가 들어 있으므로, 가진 사람은 링크가 만료될 때까지 목록의 파일을 읽을 수 있습니다.
 
@@ -136,7 +136,7 @@ review-kit done pa-review-123           # 검수 종료 후 명시적으로 삭�
 review-kit verify ./downloaded-package ./MANIFEST.json
 ```
 
-목록의 모든 파일의 크기와 SHA256을 비교하고, `MISSING`·`MISMATCH`·`EXTRA` 줄과 개수를 출력하며, 문제가 하나라도 있으면 0이 아닌 코드로 종료합니다. 폴더 안의 `INDEX.md`와 `MANIFEST.json`은 extra로 세지 않습니다. 프로필이나 네트워크가 필요 없습니다.
+목록의 모든 파일의 크기와 SHA256을 비교하고, `MISSING`·`MISMATCH`·`EXTRA` 줄과 개수를 출력하며, 문제가 하나라도 있으면 0이 아닌 코드로 종료합니다. 폴더 안의 `INDEX.md`, `MANIFEST.json`, `MANIFEST.review-kit.json`은 extra로 세지 않습니다. 프로필이나 네트워크가 필요 없습니다.
 
 ### share: Google Drive 업로드 확인 후 공유
 
@@ -151,7 +151,11 @@ review-kit --profile work share ./clip.mp4 reviews/2026-11 --host drive-mac   # 
 
 1. **drive**: `<drive_root>/<drive-dest>/<src 이름>`에 복사합니다. 이후 `--interval`(15초)마다 확인하며, 모든 파일이 `isUploaded = 1`, `isUploading = 0`이 될 때까지 최대 `--wait`(10분) 기다립니다. 성공하면 `route: drive`와 Drive 경로를 출력합니다.
 2. **dropbox**: 시간 초과나 복사 실패 시 rclone(`copyto`, `link`)으로 `DROPBOX_REMOTE`에 `share upload`합니다. `route: dropbox`와 INDEX 링크를 출력합니다.
-3. **supabase / s3**: Dropbox도 실패하면 프로필의 `BACKEND`에 서명 링크로 `share upload`합니다. `route: supabase`(또는 `s3`)와 INDEX 링크를 출력합니다.
+3. **supabase / s3**: Dropbox도 실패하면 스토리지 저장소에 서명 링크로 `share upload`합니다. 저장소는 전역 `--backend`, 없으면 프로필의 `BACKEND`, 없으면 `supabase`입니다. `route: supabase`(또는 `s3`)와 INDEX 링크를 출력합니다. 경로마다 한 번만 시도하므로, `BACKEND=dropbox`(또는 `drive`)이면 스토리지 단계가 없습니다.
+
+`share`는 Drive 파일을 덮어쓰지 않습니다. `drive-dest` 아래 파일에 이미 다른 내용이 있으면 아무것도 복사하기 전에 멈추고, 다음 경로로 넘어가지도 않습니다. 다른 `drive-dest`를 고르거나 기존 파일을 옮기세요. SHA256이 같은 파일은 그대로 둡니다.
+
+rclone이 `path/insufficient_space`를 보고하면, note에 Dropbox 용량 부족과 `rclone about` 사용량, 그리고 `share-gc --apply`가 지울 Dropbox 패키지 목록을 출력합니다. 아무것도 삭제하지 않고 스토리지 단계로 넘어갑니다.
 
 어느 경로든 성공하면 종료 코드는 0입니다. 다음 경로로 넘어간 이유는 stderr에 `note: ...`로 출력합니다. Dropbox·스토리지 패키지는 파일별 Drive 경로와 함께 프로필 원장에 기록됩니다. 그래서 `status`, `done`, `prune`, `resign`, `ls`를 그대로 쓸 수 있고, 모든 명령에 `--backend dropbox`(또는 `drive`)를 지정할 수 있습니다. rclone 공유 링크는 만료되지 않으므로, Dropbox의 INDEX 만료일은 검토 기간 표시일 뿐입니다. 점(.)으로 시작하는 파일(`.DS_Store` 등)은 공유하지 않습니다.
 

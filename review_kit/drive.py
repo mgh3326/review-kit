@@ -62,13 +62,21 @@ def _decode(data):
     return (data or b"").decode("utf-8", "replace")
 
 
-def default_run(argv, stdin=None):
-    """(returncode, stdout, stderr) for argv; a missing program is returncode 127."""
+# Long enough for an rclone/rsync copy of a large package; a hung fileproviderctl,
+# ssh or rclone still ends, so the --wait deadline and share-gc cannot block forever.
+COMMAND_TIMEOUT_SECONDS = 3600
+
+
+def default_run(argv, stdin=None, timeout=COMMAND_TIMEOUT_SECONDS):
+    """(returncode, stdout, stderr) for argv; a missing program is returncode 127,
+    one that runs past timeout is killed and returns 124."""
     try:
         result = subprocess.run([str(arg) for arg in argv], input=stdin,  # nosec B603
-                                capture_output=True)
+                                capture_output=True, timeout=timeout)
     except FileNotFoundError:
         return 127, b"", ("%s: command not found" % argv[0]).encode("utf-8")
+    except subprocess.TimeoutExpired:
+        return 124, b"", ("%s: timed out after %ss" % (argv[0], timeout)).encode("utf-8")
     return result.returncode, result.stdout, result.stderr
 
 
@@ -242,6 +250,9 @@ class LocalHost:
         Path(target).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(str(source), str(target))
 
+    def exists(self, path):
+        return os.path.lexists(path)
+
     def remove(self, paths):
         for path in paths:
             with contextlib.suppress(FileNotFoundError):
@@ -333,6 +344,12 @@ class SshHost(LocalHost):
         if code:
             raise RuntimeError("rsync to %s failed (exit %d): %s"
                                % (self.label, code, _short(err)))
+
+    def exists(self, path):
+        code, _, err = self.ssh(["test", "-e", path, "-o", "-L", path])
+        if code not in (0, 1):
+            raise RuntimeError("test on %s failed (exit %d): %s" % (self.label, code, _short(err)))
+        return code == 0
 
     def remove(self, paths):
         if paths:

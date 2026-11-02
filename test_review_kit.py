@@ -303,11 +303,37 @@ class ShareTests(unittest.TestCase):
                 upload_folder(self.folder, "bad", 1, self.backend, self.ledger, issue=bad)
         self.assertNotIn("bad/MANIFEST.json", self.backend.objects)
 
-    def test_input_folder_may_not_contain_a_manifest(self):
-        (self.folder / "MANIFEST.json").write_text("{}", encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "MANIFEST.json is generated"):
-            upload_folder(self.folder, "clash", 1, self.backend, self.ledger)
+    def test_input_folder_may_not_contain_a_review_kit_manifest(self):
+        for name, data in (("MANIFEST.json", '{"schema": "review-kit-manifest/1"}'),
+                           ("MANIFEST.review-kit.json", "{}")):
+            (self.folder / name).write_text(data, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "%s is generated" % name):
+                upload_folder(self.folder, "clash", 1, self.backend, self.ledger)
+            (self.folder / name).unlink()
         self.assertEqual(self.backend.objects, {})
+
+    def test_foreign_manifest_is_kept_and_review_kit_manifest_goes_beside_it(self):
+        foreign = b'{"schema": "other-tool/2", "items": [1, 2]}\n'
+        (self.folder / "MANIFEST.json").write_bytes(foreign)
+        result = upload_folder(self.folder, "own", 1, self.backend, self.ledger)
+        self.assertEqual(self.backend.objects["own/MANIFEST.json"][0], foreign)
+        sidecar = json.loads(self.backend.objects["own/MANIFEST.review-kit.json"][0])
+        self.assertEqual(sidecar["schema"], "review-kit-manifest/1")
+        self.assertIn("MANIFEST.json", [entry["relative_path"] for entry in sidecar["files"]])
+        self.assertIn("[MANIFEST.review-kit.json]", result["index"].decode("utf-8"))
+
+        resigned = resign_package(self.backend, self.ledger, "own", days=2)
+        self.assertEqual(self.backend.objects["own/MANIFEST.json"][0], foreign)
+        self.assertEqual(self.backend.objects["own/MANIFEST.review-kit.json"][0],
+                         resigned["manifest"])
+
+        download = self.root / "download"
+        download.mkdir()
+        for obj in resigned["record"]["objects"]:
+            (download / obj["file"]).write_bytes(self.backend.objects[obj["key"]][0])
+        checked = verify_folder(download, download / "MANIFEST.review-kit.json")
+        self.assertEqual((checked["missing"], checked["mismatch"], checked["extra"]),
+                         ([], [], []))
 
     def test_resign_refreshes_manifest_links_and_expiry(self):
         original = dt.datetime(2026, 10, 24, 0, 0, tzinfo=dt.timezone.utc)
