@@ -501,6 +501,12 @@ class BackendTests(Base):
         self.assertEqual((self.remote_root / "reviews" / "INDEX.md").read_bytes(), data)
         self.assertEqual(backend.list_objects("reviews"), [("reviews/INDEX.md", 5)])
         self.assertEqual(backend.relative((self.remote_root / "reviews").as_posix()), "reviews")
+        # A $HOME that printed nothing is refused rather than turned into "/remote-drive".
+        self.world.home = ""
+        empty = create_backend(self.config, "drive", run=self.world, hosts=self.hosts,
+                               host="mount")
+        with self.assertRaisesRegex(RuntimeError, "could not read \\$HOME"):
+            empty.list_objects("reviews")
 
     def test_dropbox_missing_file_is_a_miss_not_an_error(self):
         backend = DropboxBackend(self.config, run=self.world)

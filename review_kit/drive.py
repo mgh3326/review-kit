@@ -385,7 +385,7 @@ class SshHost(LocalHost):
             return root
         if getattr(self, "_home", None) is None:
             home = _decode(self._checked(["sh", "-c", 'printf "%s" "$HOME"'])).strip()
-            if not home.startswith("/"):
+            if not home or "\n" in home:
                 raise RuntimeError("could not read $HOME on %s" % self.label)
             self._home = home.rstrip("/")
         return self._home + root[1:]
