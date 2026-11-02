@@ -39,3 +39,4 @@ jobs:
         run: |
           python test_prep_video.py
           python test_review_kit.py
+          python test_drive_share.py

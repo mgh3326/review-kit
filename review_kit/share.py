@@ -6,9 +6,13 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
+import time
 import unicodedata
 from urllib.parse import quote
+
+from .drive import summarize
 
 
 WARN_BYTES = 800_000_000
@@ -134,6 +138,8 @@ def _files_under(folder):
         directories.sort()
         for name in sorted(names):
             path = root_path / name
+            if name.startswith("."):
+                continue  # Finder/editor dotfiles are never review material
             if path.is_symlink():
                 raise ValueError("Symbolic-link files are not supported in upload folders")
             if not path.is_file():
@@ -185,6 +191,20 @@ def _check_record_backend(backend, record):
                            recorded)
 
 
+def _key_function(backend):
+    """Supabase/S3 keys are ASCII-safe; Drive and Dropbox keep readable names."""
+    return getattr(backend, "object_key", safe_key)
+
+
+def record_keys(backend, prefix, record):
+    """Object keys of a ledger package; imported legacy packages are listed by prefix."""
+    if record.get("legacy"):
+        root = record.get("legacy_prefix") or prefix
+        return [key for key, _ in backend.list_objects(root + "/")]
+    return [obj["key"] for obj in record.get("objects", [])
+            if isinstance(obj, dict) and isinstance(obj.get("key"), str)]
+
+
 def build_manifest(prefix, version, issue, created, expires, rows):
     """Build MANIFEST.json bytes (machine-readable twin of INDEX.md) from signed row links."""
     manifest = {
@@ -222,14 +242,23 @@ def build_index(prefix, expiry_date, rows, drive_folder_url=None, manifest_url=N
 
 def prune_packages(backend, ledger_path, dry_run=False, now=None,
                    high_water_bytes=DEFAULT_HIGH_WATER_BYTES,
-                   low_water_bytes=DEFAULT_LOW_WATER_BYTES):
-    """Delete oldest tracked packages only when bucket usage crosses high water."""
+                   low_water_bytes=DEFAULT_LOW_WATER_BYTES, exclude=()):
+    """Delete oldest tracked packages only when bucket usage crosses high water.
+
+    exclude: prefixes another step already removes; their bytes count as freed.
+    Backends with capacity_managed = False (Drive) are never pruned.
+    """
     if high_water_bytes <= low_water_bytes or low_water_bytes < 0:
         raise ValueError("Prune watermarks must satisfy high > low >= 0")
+    if not getattr(backend, "capacity_managed", True):
+        return []
     ledger = load_ledger(ledger_path)
     remote_objects = backend.list_objects("")
     sizes = dict(remote_objects)
-    usage = sum(sizes.values())
+    excluded = set(exclude)
+    usage = sum(sizes.values()) - sum(
+        sizes.get(key, 0) for prefix in excluded if prefix in ledger["packages"]
+        for key in record_keys(backend, prefix, ledger["packages"][prefix]))
     if usage <= high_water_bytes:
         return []
 
@@ -237,6 +266,8 @@ def prune_packages(backend, ledger_path, dry_run=False, now=None,
     for prefix, record in ledger["packages"].items():
         recorded_backend = record.get("backend")
         if recorded_backend is not None and recorded_backend != getattr(backend, "name", None):
+            continue
+        if prefix in excluded:
             continue
         try:
             uploaded = dt.datetime.fromisoformat(record["uploaded"])
@@ -251,8 +282,7 @@ def prune_packages(backend, ledger_path, dry_run=False, now=None,
     for uploaded, prefix, record in packages:
         if usage <= low_water_bytes:
             break
-        keys = [obj["key"] for obj in record.get("objects", [])
-                if isinstance(obj, dict) and isinstance(obj.get("key"), str)]
+        keys = record_keys(backend, prefix, record)
         freed = sum(sizes.get(key, 0) for key in keys)
         pruned.append((prefix, uploaded, keys))
         if not dry_run:
@@ -270,7 +300,8 @@ def upload_folder(folder, prefix, days, backend, ledger_path, drive_manifest=Non
                   low_water_bytes=DEFAULT_LOW_WATER_BYTES, version=DEFAULT_VERSION, issue=None):
     if not 1 <= int(days) <= 7:
         raise ValueError("Signed-link lifetime must be between 1 and 7 days")
-    prefix_key = safe_key(prefix)
+    key_of = _key_function(backend)
+    prefix_key = key_of(prefix)
     version = _single_line(version, "--version")
     issue = None if issue is None else _single_line(issue, "--issue")
     drive_manifest = _validate_drive_manifest(drive_manifest)
@@ -312,7 +343,7 @@ def upload_folder(folder, prefix, days, backend, ledger_path, drive_manifest=Non
                 rows.append(row)
                 file_records.append(dict(row))
                 continue
-            key = safe_key(prefix_key, relative)
+            key = key_of(prefix_key, relative)
             created = backend.put_file(key, path, content_type(path), digest)
             if created:
                 created_keys.append(key)
@@ -372,7 +403,7 @@ def resign_package(backend, ledger_path, prefix, days=7, now=None):
     """Refresh signed storage links and INDEX without re-uploading package files."""
     if not 1 <= int(days) <= 7:
         raise ValueError("Signed-link lifetime must be between 1 and 7 days")
-    prefix_key = safe_key(prefix)
+    prefix_key = _key_function(backend)(prefix)
     ledger = load_ledger(ledger_path)
     record = ledger["packages"].get(prefix_key)
     if record is None:
@@ -439,14 +470,13 @@ def resign_package(backend, ledger_path, prefix, days=7, now=None):
 
 
 def done_package(backend, ledger_path, prefix):
-    prefix_key = safe_key(prefix)
+    prefix_key = _key_function(backend)(prefix)
     ledger = load_ledger(ledger_path)
     record = ledger["packages"].get(prefix_key)
     if record is None:
         raise ValueError("No tracked package with that prefix")
     _check_record_backend(backend, record)
-    keys = [obj["key"] for obj in record.get("objects", [])
-            if isinstance(obj, dict) and isinstance(obj.get("key"), str)]
+    keys = record_keys(backend, prefix_key, record)
     if keys:
         backend.delete_keys(keys)
     del ledger["packages"][prefix_key]
@@ -460,3 +490,295 @@ def package_status(backend, ledger_path):
     total_bytes = sum(size for _, size in objects)
     return {"objects": len(objects), "bytes": total_bytes,
             "packages": ledger["packages"], "warning": total_bytes > WARN_BYTES}
+
+
+# --- share <src> <drive-dest>: Drive, then Dropbox, then Supabase/S3 ------------
+
+DEFAULT_WAIT_SECONDS = 600
+DEFAULT_INTERVAL_SECONDS = 15
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600}
+
+
+def parse_duration(text):
+    """Seconds from '90', '30s', '10m' or '1h'."""
+    value = str(text).strip().lower()
+    unit = value[-1:] if value[-1:] in DURATION_UNITS else "s"
+    number = value[:-1] if value[-1:] in DURATION_UNITS else value
+    try:
+        seconds = float(number) * DURATION_UNITS[unit]
+    except ValueError:
+        raise ValueError("Durations look like 90, 30s, 10m or 1h")
+    if seconds < 0:
+        raise ValueError("Durations must not be negative")
+    return seconds
+
+
+def _duration_text(seconds):
+    seconds = int(seconds)
+    for unit, size in (("h", 3600), ("m", 60)):
+        if seconds and seconds % size == 0:
+            return "%d%s" % (seconds // size, unit)
+    return "%ds" % seconds
+
+
+def _share_sources(source):
+    """[(relative to the source's parent, path)] for a file or folder, sorted."""
+    if source.is_symlink():
+        raise ValueError("Symbolic links are not supported as share sources")
+    if source.is_file():
+        return [(source.name, source)]
+    _, files = _files_under(source)
+    if not files:
+        raise ValueError("Share folder has no files")
+    return [(source.name + "/" + relative, path) for relative, path in files]
+
+
+def _wait_uploaded(drive, keys, wait, interval, sleep, clock):
+    deadline = clock() + wait
+    while True:
+        status = drive.upload_status(keys)
+        remaining = deadline - clock()
+        if status["all_uploaded"] or remaining <= 0:
+            return status
+        sleep(min(interval, remaining))
+
+
+def backend_watermarks(config, backend_name):
+    """(high, low) bytes; Dropbox may set its own DROPBOX_*_WATER_MB marks."""
+    names = ("PRUNE_HIGH_WATER_MB", "PRUNE_LOW_WATER_MB")
+    if backend_name == "dropbox" and config.get("DROPBOX_HIGH_WATER_MB"):
+        names = ("DROPBOX_HIGH_WATER_MB", "DROPBOX_LOW_WATER_MB")
+    try:
+        high = float(config.get(names[0]) or DEFAULT_HIGH_WATER_BYTES / 1_000_000)
+        low = float(config.get(names[1]) or (high * 0.8 if names[0].startswith("DROPBOX")
+                                             else DEFAULT_LOW_WATER_BYTES / 1_000_000))
+    except (TypeError, ValueError):
+        raise ValueError("Prune watermarks must be numeric megabyte values")
+    if not 0 <= low < high:
+        raise ValueError("Prune watermarks must satisfy high > low >= 0")
+    return int(high * 1_000_000), int(low * 1_000_000)
+
+
+def _upload_fallback(config, name, source, share_id, days, drive_keys, host_name, factory):
+    """upload_folder to one fallback backend and link the package to its Drive files."""
+    backend = factory(config, name)
+    ledger_path = config["_LEDGER_PATH"]
+    high, low = backend_watermarks(config, name)
+    with tempfile.TemporaryDirectory() as stage:
+        folder = source
+        if source.is_file():
+            folder = Path(stage)
+            shutil.copy2(str(source), str(folder / source.name))
+        result = upload_folder(folder, share_id, days, backend, ledger_path,
+                               backend_name=name, high_water_bytes=high, low_water_bytes=low)
+    ledger = load_ledger(ledger_path)
+    record = ledger["packages"][result["prefix"]]
+    strip = 0 if source.is_file() else len(source.name) + 1
+    record["drive"] = {"host": host_name or "local",
+                       "keys": {relative[strip:]: key for relative, key in drive_keys.items()}}
+    record["source"] = str(source)
+    save_ledger(ledger_path, ledger)
+    return result
+
+
+def share_with_fallback(config, source, drive_dest, host_name=None, hosts=None,
+                        wait=DEFAULT_WAIT_SECONDS, interval=DEFAULT_INTERVAL_SECONDS, days=7,
+                        run=None, sleep=time.sleep, clock=time.monotonic,
+                        backend_factory=None, now=None):
+    """Copy source into Drive and wait for File Provider to upload it; on timeout or
+    failure upload it to Dropbox, then to the profile's Supabase/S3 backend."""
+    from .backends import create_backend
+
+    def factory(cfg, name, **extra):
+        maker = backend_factory or create_backend
+        return maker(cfg, name, run=run, hosts=hosts, **extra)
+
+    source = Path(source).expanduser().absolute()
+    files = _share_sources(source)
+    errors = []
+    result = {"source": str(source), "host": host_name or "local", "errors": errors}
+    drive = factory(config, "drive", host=host_name)
+    dest = drive.relative(drive_dest)
+    drive_keys = {relative: drive.object_key(dest, relative) for relative, _ in files}
+    result["drive_path"] = drive.path(drive.object_key(dest, source.name))
+    try:
+        for relative, path in files:
+            drive.put_file(drive_keys[relative], path, content_type(path), sha256_file(path))
+        status = _wait_uploaded(drive, list(drive_keys.values()), wait, interval, sleep, clock)
+        result["drive_status"] = summarize(status["files"])
+        if status["all_uploaded"]:
+            result["route"] = "drive"
+            return result
+        errors.append("drive: not uploaded within %s (%s)"
+                      % (_duration_text(wait), result["drive_status"]))
+    except (OSError, RuntimeError, ValueError) as exc:
+        result["drive_status"] = "copy failed"
+        errors.append("drive: %s" % exc)
+
+    now = now or utc_now()
+    share_id = "%s-%s" % (now.strftime("%Y%m%dT%H%M%SZ"), safe_component(source.name))
+    for name in ("dropbox", (config.get("BACKEND") or "supabase").lower()):
+        try:
+            uploaded = _upload_fallback(config, name, source, share_id, days, drive_keys,
+                                        host_name, factory)
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append("%s: %s" % (name, exc))
+            continue
+        result.update(route=name, link=uploaded["index_url"], prefix=uploaded["prefix"])
+        return result
+    raise RuntimeError("No share route worked: " + "; ".join(errors))
+
+
+# --- share-gc ------------------------------------------------------------------
+
+def gc_log_path(config):
+    if config.get("SHARE_GC_LOG"):
+        return Path(config["SHARE_GC_LOG"]).expanduser()
+    root = os.environ.get("REVIEW_KIT_STATE_DIR")
+    base = Path(root).expanduser() if root else Path.home() / ".local" / "state" / "review-kit"
+    return base / "share-gc.log"
+
+
+def _drive_confirmed(drive, record):
+    """(True, '') when every package file is uploaded on Drive with the same sha256."""
+    keys_by_file = (record.get("drive") or {}).get("keys") or {}
+    files = [entry for entry in record.get("files", []) if entry.get("source") == "storage"]
+    keys = [keys_by_file.get(entry["file"]) for entry in files]
+    if not files or None in keys:
+        return False, "package files have no Drive mapping"
+    status = drive.upload_status(keys)
+    if not status["all_uploaded"]:
+        return False, "Drive not uploaded (%s)" % summarize(status["files"])
+    for key, entry in zip(keys, files):
+        if drive.object_sha256(key) != entry["sha256"]:
+            return False, "Drive sha256 differs for %s" % entry["file"]
+    return True, ""
+
+
+class _Backends:
+    """One backend instance per name; a failure to build one is remembered."""
+
+    def __init__(self, config, factory):
+        self.config, self.factory, self.cache = config, factory, {}
+
+    def get(self, name, **extra):
+        key = (name, tuple(sorted(extra.items())))
+        if key not in self.cache:
+            try:
+                self.cache[key] = self.factory(self.config, name, **extra)
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.cache[key] = exc
+        if isinstance(self.cache[key], Exception):
+            raise self.cache[key]
+        return self.cache[key]
+
+
+def _gc_drive_pass(ledger, backends):
+    """(prefix, backend name, reason) to delete, and kept rows, from the Drive check."""
+    actions, kept = [], []
+    for prefix, record in sorted(ledger["packages"].items()):
+        link = record.get("drive")
+        if not link or record.get("backend") == "drive":
+            continue
+        try:
+            host = link.get("host")
+            drive = backends.get("drive", host=None if host == "local" else host)
+            confirmed, reason = _drive_confirmed(drive, record)
+        except (OSError, RuntimeError, ValueError) as exc:
+            confirmed, reason = False, "Drive check failed: %s" % exc
+        if confirmed:
+            actions.append((prefix, record.get("backend"), "Drive uploaded, sha256 match"))
+        else:
+            kept.append({"prefix": prefix, "backend": record.get("backend"), "reason": reason})
+    return actions, kept
+
+
+def share_gc(config, apply=False, hosts=None, run=None, backend_factory=None, now=None):
+    """Delete Dropbox/Supabase/S3 packages whose files Drive holds uploaded with the same
+    sha256, then prune any backend above its capacity mark. Dry run unless apply."""
+    from .backends import create_backend
+
+    def factory(cfg, name, **extra):
+        return (backend_factory or create_backend)(cfg, name, run=run, hosts=hosts, **extra)
+
+    ledger_path = config["_LEDGER_PATH"]
+    backends = _Backends(config, factory)
+    actions, kept = _gc_drive_pass(load_ledger(ledger_path), backends)
+    now = now or utc_now()
+    rows = []
+
+    def record_row(prefix, name, reason, run_delete):
+        row = {"utc": now.isoformat(), "prefix": prefix, "backend": name, "reason": reason,
+               "applied": False}
+        if apply:
+            try:
+                run_delete()
+                row["applied"] = True
+            except (OSError, RuntimeError, ValueError) as exc:
+                row["error"] = str(exc)
+            _append_log(gc_log_path(config), row)
+        rows.append(row)
+
+    for prefix, name, reason in actions:
+        record_row(prefix, name, reason,
+                   lambda p=prefix, n=name: done_package(backends.get(n), ledger_path, p))
+    planned = {prefix for prefix, _, _ in actions}
+    names = sorted({record.get("backend") for record in load_ledger(ledger_path)["packages"]
+                    .values() if record.get("backend") not in (None, "drive")})
+    for name in names:
+        try:
+            backend = backends.get(name)
+            high, low = backend_watermarks(config, name)
+            pruned = prune_packages(backend, ledger_path, dry_run=not apply, now=now,
+                                    high_water_bytes=high, low_water_bytes=low,
+                                    exclude=planned)
+        except (OSError, RuntimeError, ValueError) as exc:
+            rows.append({"utc": now.isoformat(), "prefix": None, "backend": name,
+                         "reason": "capacity check", "applied": False, "error": str(exc)})
+            continue
+        for prefix, _, _ in pruned:
+            row = {"utc": now.isoformat(), "prefix": prefix, "backend": name,
+                   "reason": "%s above its capacity mark (%d MB)" % (name, high // 1_000_000),
+                   "applied": bool(apply)}
+            if apply:
+                _append_log(gc_log_path(config), row)
+            rows.append(row)
+            planned.add(prefix)
+    kept = [row for row in kept if row["prefix"] not in planned]
+    return {"applied": bool(apply), "actions": rows, "kept": kept}
+
+
+def _append_log(path, row):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path), "a", encoding="utf-8") as log:
+        log.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def import_legacy_ledger(ledger_path, legacy_path, backend_name):
+    """Track packages from a flat dots-share ledger ({prefix: {uploaded, expires, ...}}).
+
+    Their object keys are not recorded, so done/prune list them by prefix.
+    """
+    try:
+        legacy = json.loads(Path(legacy_path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ValueError("Could not read the legacy ledger")
+    if not isinstance(legacy, dict) or "packages" in legacy:
+        raise ValueError("Legacy ledger must be a flat {prefix: record} object")
+    ledger = load_ledger(ledger_path)
+    added, skipped = [], []
+    for prefix, old in sorted(legacy.items()):
+        if not isinstance(old, dict) or "uploaded" not in old:
+            raise ValueError("Legacy ledger entry %s has no upload date" % prefix)
+        key = safe_key(prefix)
+        if key in ledger["packages"]:
+            skipped.append(key)
+            continue
+        ledger["packages"][key] = {
+            "uploaded": old["uploaded"], "expires": old.get("expires"),
+            "bytes": int(old.get("bytes", 0)), "backend": backend_name, "objects": [],
+            "legacy": True, "legacy_prefix": prefix, "source": old.get("source")}
+        added.append(key)
+    save_ledger(ledger_path, ledger)
+    return added, skipped

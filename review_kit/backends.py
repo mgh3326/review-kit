@@ -4,10 +4,15 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import os
+import tempfile
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+
+from .drive import default_run, drive_status, load_hosts, make_host
 
 
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
@@ -417,8 +422,186 @@ class S3Backend:
                 raise RuntimeError("S3 deletion failed (HTTP %d)" % status)
 
 
-def create_backend(config, backend=None):
+def readable_key(prefix, relative_path=None):
+    """Traversal-free key that keeps names as people see them (Drive and Dropbox paths)."""
+    raw_parts = str(prefix).replace("\\", "/").split("/")
+    if relative_path:
+        raw_parts += str(relative_path).replace("\\", "/").split("/")
+    parts = []
+    for raw in raw_parts:
+        part = unicodedata.normalize("NFC", raw)
+        if part in ("", ".", "..") or any(unicodedata.category(char) == "Cc" for char in part):
+            raise ValueError("Paths must not contain empty, traversal or control-character "
+                             "components")
+        parts.append(part)
+    return "/".join(parts)
+
+
+def _temporary_copy(data):
+    temporary = tempfile.NamedTemporaryFile(delete=False)
+    try:
+        temporary.write(data)
+    finally:
+        temporary.close()
+    return temporary.name
+
+
+class DriveBackend:
+    """Files under a Google Drive mount, on this Mac or a mount host over ssh.
+
+    Links are Drive paths, not URLs: reviewers open the shared Drive folder.
+    The Drive copy is the canonical one, so capacity pruning never touches it.
+    """
+    name = "drive"
+    capacity_managed = False
+    object_key = staticmethod(readable_key)
+
+    def __init__(self, host):
+        if not host.drive_root:
+            raise ValueError("Drive needs drive_root for %s in hosts.toml "
+                             "([local] or [hosts.<name>])" % host.label)
+        self.host = host
+        self.root = host.drive_root
+
+    def path(self, key):
+        return self.host.join(self.root, key) if key else self.root
+
+    def relative(self, path):
+        """A key for a Drive path given absolute (under drive_root) or relative to it."""
+        path = str(path).replace("\\", "/")
+        root = str(self.root).replace("\\", "/").rstrip("/")
+        if path == root or path.startswith(root + "/"):
+            path = path[len(root) + 1:]
+        elif path.startswith(("/", "~")) or (len(path) > 1 and path[1] == ":"):
+            raise ValueError("Drive destination must be under drive_root (%s)" % self.root)
+        return readable_key(path)
+
+    def put_file(self, key, path, content_type, digest):
+        target = self.path(key)
+        if self.host.sha256(target) == digest:
+            return False
+        self.host.put_file(path, target)
+        if self.host.sha256(target) != digest:
+            raise RuntimeError("Drive copy of %s does not match its sha256" % key)
+        return True
+
+    def put_bytes(self, key, data, content_type, digest):
+        name = _temporary_copy(data)
+        try:
+            return self.put_file(key, name, content_type, digest)
+        finally:
+            os.unlink(name)
+
+    def replace_bytes(self, key, data, content_type, digest):
+        self.put_bytes(key, data, content_type, digest)
+
+    def object_sha256(self, key):
+        return self.host.sha256(self.path(key))
+
+    def sign_get(self, key, expires):
+        return self.path(key)
+
+    def list_objects(self, prefix=""):
+        root = str(self.root).replace("\\", "/").rstrip("/") + "/"
+        found = []
+        for path, size in self.host.list_sizes(self.path(prefix.strip("/"))):
+            path = str(path).replace("\\", "/")
+            if path.startswith(root):
+                found.append((path[len(root):], size))
+        return sorted(found)
+
+    def delete_keys(self, keys):
+        self.host.remove([self.path(key) for key in keys])
+
+    def upload_status(self, keys):
+        """drive_status for the Drive files behind keys (File Provider upload state)."""
+        return drive_status(self.host, [self.path(key) for key in keys], expand=False)
+
+
+class DropboxBackend:
+    """Dropbox through an rclone remote (DROPBOX_REMOTE=remote:folder).
+
+    rclone share links do not expire on the free plan, so INDEX expiry dates are
+    the review window, not a link lifetime; share-gc and prune remove the copies.
+    """
+    name = "dropbox"
+    object_key = staticmethod(readable_key)
+
+    def __init__(self, config, run=None):
+        remote = (config.get("DROPBOX_REMOTE") or "").strip().rstrip("/")
+        if not remote or ":" not in remote or remote.startswith("-"):
+            raise ValueError("Dropbox needs DROPBOX_REMOTE=<rclone remote>:<folder>")
+        self.remote = remote
+        self.run = run or default_run
+
+    def _rclone(self, *args, missing_ok=False):
+        code, out, err = self.run(["rclone"] + list(args))
+        if code == 3 and missing_ok:  # rclone: directory not found
+            return None
+        if code:
+            detail = " ".join((err or b"").decode("utf-8", "replace").split())[:200]
+            raise RuntimeError("rclone %s failed (exit %d)%s"
+                               % (args[0], code, ("; " + detail) if detail else ""))
+        return out
+
+    def _path(self, key):
+        return self.remote + "/" + key if key else self.remote
+
+    def put_file(self, key, path, content_type, digest):
+        self._rclone("copyto", str(path), self._path(key))
+        return True
+
+    def put_bytes(self, key, data, content_type, digest):
+        name = _temporary_copy(data)
+        try:
+            return self.put_file(key, name, content_type, digest)
+        finally:
+            os.unlink(name)
+
+    def replace_bytes(self, key, data, content_type, digest):
+        self.put_bytes(key, data, content_type, digest)
+
+    def object_sha256(self, key):
+        out = self._rclone("hashsum", "sha256", "--download", self._path(key), missing_ok=True)
+        words = (out or b"").decode("utf-8", "replace").split()
+        return words[0].lower() if words else None
+
+    def sign_get(self, key, expires):
+        lines = [line.strip() for line in
+                 self._rclone("link", self._path(key)).decode("utf-8", "replace").splitlines()
+                 if line.strip()]
+        if not lines or not lines[-1].startswith(("https://", "http://")):
+            raise RuntimeError("rclone link did not return a share URL")
+        return lines[-1]
+
+    def list_objects(self, prefix=""):
+        prefix = prefix.strip("/")
+        out = self._rclone("lsjson", "-R", "--files-only", self._path(prefix), missing_ok=True)
+        try:
+            items = json.loads((out or b"[]").decode("utf-8"))
+        except ValueError:
+            raise RuntimeError("rclone lsjson returned invalid JSON")
+        return sorted(((prefix + "/" + item["Path"]) if prefix else item["Path"],
+                       int(item.get("Size", 0))) for item in items)
+
+    def delete_keys(self, keys):
+        for key in keys:
+            self._rclone("deletefile", self._path(key))
+        if keys:
+            self.run(["rclone", "rmdirs", "--leave-root", self.remote])
+
+
+BACKENDS = ("supabase", "s3", "dropbox", "drive")
+
+
+def create_backend(config, backend=None, run=None, hosts=None, host=None):
+    """Storage backend by name; drive uses hosts.toml (host None = this Mac)."""
     selected = (backend or config.get("BACKEND", "supabase")).lower()
+    if selected == "dropbox":
+        return DropboxBackend(config, run=run)
+    if selected == "drive":
+        return DriveBackend(make_host(load_hosts() if hosts is None else hosts, host,
+                                      run=run, config=config))
     if selected == "supabase":
         required = ("SUPABASE_URL", "SUPABASE_BUCKET")
         missing = [name for name in required if not config.get(name)]
@@ -431,4 +614,4 @@ def create_backend(config, backend=None):
         if missing:
             raise ValueError("S3 profile is missing: " + ", ".join(missing))
         return S3Backend(config)
-    raise ValueError("Backend must be supabase or s3")
+    raise ValueError("Backend must be one of: " + ", ".join(BACKENDS))

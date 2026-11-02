@@ -134,7 +134,7 @@ review-kit resign pa-review-123   # refresh signed links without re-uploading fi
 review-kit done pa-review-123     # delete this package after review
 ```
 
-`--backend supabase|s3` is a global option for commands that inspect or manage a backend. Put it before the command (`review-kit --backend s3 done pa-review-123`); `share upload` also accepts it after the prefix. Cleanup and re-sign commands verify the ledger's recorded backend before acting. Capacity pruning only considers tracked packages for the selected backend; records without a backend field use the selected backend for compatibility.
+`--backend supabase|s3|dropbox|drive` is a global option for commands that inspect or manage a backend. Put it before the command (`review-kit --backend s3 done pa-review-123`); `share upload` also accepts it after the prefix. Cleanup and re-sign commands verify the ledger's recorded backend before acting. Capacity pruning only considers tracked packages for the selected backend; records without a backend field use the selected backend for compatibility.
 
 Expiry applies to links; it does not delete stored files. Retention is based on bucket capacity. `prune` does nothing at or below the high-water mark; above it, it removes the oldest tracked packages until usage reaches the low-water mark. Defaults are **900 MB high / 700 MB low** (decimal MB) for a 1 GB bucket. Set `PRUNE_HIGH_WATER_MB` and `PRUNE_LOW_WATER_MB` in the profile, or override them on the `prune` command. `share upload` runs this capacity check before uploading.
 
@@ -165,47 +165,68 @@ It compares the size and SHA256 of every listed file, prints `MISSING`, `MISMATC
 
 Upload refuses to overwrite any existing storage key unless its recorded SHA256 matches. Use a fresh prefix for each package; run `done` to remove an active package before reusing its prefix.
 
-### Deliver to Drive with Dropbox and storage fallbacks
+### Share to Google Drive with a real upload check
 
-`deliver` is the one-step version of the manual Drive → Dropbox → storage routine for reviewers who check those locations in order:
+Drive for desktop shows a copied file at once, but it may still be uploading. `share` copies into the Drive mount, asks macOS File Provider (`fileproviderctl evaluate`) whether every file is uploaded, and falls back when the upload does not finish in time:
 
 ```bash
-review-kit --profile work deliver ./review-package pa-review-123
+review-kit --profile work share ./pa-review-123 reviews/2026-11 --wait 10m
+review-kit --profile work share ./clip.mp4 reviews/2026-11 --host drive-mac   # copy to another Mac over ssh/rsync
 ```
 
-1. The package is copied into `DRIVE_MOUNT_DIR/<name>/`, a local path to a Drive-for-desktop mount or an ssh target such as `host:/path` (each file is streamed over `ssh`, no extra tooling). The copy is verified against `MANIFEST.json` by byte size and SHA256. When the package has no manifest, one is generated with the shared manifest code and written next to the copy.
-2. The package is uploaded to `DROPBOX_REMOTE/<name>` with `rclone copy`, verified with `rclone check` and `rclone size`, and shared with `rclone link`.
-3. Only when the Dropbox step fails does `deliver` fall back to the configured Supabase/S3 backend — the same machinery as `share upload`, with signed links.
+The routes are backends of the same share code, tried in this order:
 
-The command writes a small `DELIVERY.json` into the package and prints a Markdown snippet with the Drive path, the Dropbox link (or the storage INDEX link), the file count, byte total and manifest SHA256 — paste it into the review request. `DELIVERY.json` is generated and is never copied or counted.
+1. **drive**: copy into `<drive_root>/<drive-dest>/<src name>`, then poll every `--interval` (15s) until every file reports `isUploaded = 1` and `isUploading = 0`, for at most `--wait` (10m). Success prints `route: drive` and the Drive path.
+2. **dropbox**: on timeout or copy failure, `share upload` to `DROPBOX_REMOTE` with rclone (`copyto`, `link`). It prints `route: dropbox` and the INDEX link.
+3. **supabase / s3**: when Dropbox fails, `share upload` to the profile's `BACKEND` with signed links. It prints `route: supabase` (or `s3`) and the INDEX link.
 
-Flags: `--no-dropbox` copies only to the Drive mount, `--force-supabase` skips Dropbox and uploads to storage directly, and `--dry-run` prints the plan without copying or uploading. There is no default remote: `deliver` needs `DRIVE_MOUNT_DIR` and (unless the flags say otherwise) `DROPBOX_REMOTE` in the profile.
+Exit status is 0 when any route worked. The reason for each fallback goes to stderr as `note: ...`. Dropbox and storage packages are recorded in the profile ledger together with the Drive path of each file, so `status`, `done`, `prune`, `resign` and `ls` work on them, and `--backend dropbox` (or `drive`) works with every command. Rclone share links do not expire, so on Dropbox the INDEX expiry date is a review window only. Dotfiles (`.DS_Store` and similar) are never shared.
+
+#### Check upload state
+
+```bash
+review-kit drive-status ~/Library/CloudStorage/GoogleDrive-*/My\ Drive/reviews/pa-review-123
+review-kit drive-status --host drive-mac --json reviews/pa-review-123
+```
+
+Each file prints `uploaded`, `uploading`, `not-uploaded` or `unknown` (for example a missing file, no `fileproviderctl`, or an unreachable host). The exit status is 0 only when every file is uploaded. Folders are expanded. Local paths are relative to the current directory. With `--host`, relative paths are relative to that host's `drive_root`.
+
+#### Hosts
+
+Host names, ssh targets and Drive roots come from `~/.config/review-kit/hosts.toml` (or `$REVIEW_KIT_CONFIG_DIR/hosts.toml`), never from the repository:
+
+```toml
+[local]                      # this Mac
+drive_root = "~/Library/CloudStorage/GoogleDrive-<account>/My Drive"
+
+[hosts.drive-mac]                  # a Mac that mounts Drive, reached with ssh
+ssh = "you@drive-mac.local"
+drive_root = "/Users/you/Library/CloudStorage/GoogleDrive-<account>/My Drive"
+# fileproviderctl = "/usr/bin/fileproviderctl"   # optional
+```
+
+`ssh` runs with `BatchMode=yes`, so set up key authentication first. The mount host needs `fileproviderctl`, `shasum` and `rsync` (all ship with macOS). Without a `[local]` entry, a local `DRIVE_MOUNT_DIR` in the profile is used as the local Drive root.
+
+#### share-gc
+
+```bash
+review-kit --profile work share-gc            # dry run: prints what it would remove
+review-kit --profile work share-gc --apply    # deletes and appends to the log
+```
+
+`share-gc` deletes a Dropbox or Supabase/S3 package only when every one of its files is uploaded on Drive and has the recorded SHA256. A Drive file that is still uploading, edited, missing or on an unreachable host keeps its copies. After that it prunes any fallback backend above its capacity mark, oldest first (the `prune` rules; `PRUNE_HIGH_WATER_MB`/`PRUNE_LOW_WATER_MB`, or `DROPBOX_HIGH_WATER_MB`/`DROPBOX_LOW_WATER_MB` for Dropbox). Drive itself is never pruned. With `--apply`, every removal is appended as one JSON line to `~/.local/state/review-kit/share-gc.log` (set `SHARE_GC_LOG` to move it). A failed deletion exits 1. Run it on the machine that ran `share`, because it reads that machine's ledger.
 
 ```ini
-DRIVE_MOUNT_DIR=/path/to/Drive-mount/reviews
-# or an ssh target: DRIVE_MOUNT_DIR=host:/path/to/drive/reviews
-DROPBOX_REMOTE=dropbox:Project/review
-# optional: a command that prints yes/no once the Drive upload is visible in the cloud
-DRIVE_CHECK_CMD=/path/to/drive-visible.sh
+# profile additions
+DROPBOX_REMOTE=dropbox:review-share
+# optional Dropbox capacity marks (MB); default to the PRUNE_* marks
+DROPBOX_HIGH_WATER_MB=1500
+DROPBOX_LOW_WATER_MB=1200
 ```
 
-`rclone` and `ssh` must be on `PATH`; rclone needs its own configured Dropbox remote. Delivery names allow letters, digits, dot, underscore, dash and optional `/` nesting.
+`import-ledger <ledger.json>` tracks the packages in an older flat `{prefix: {uploaded, expires, bytes}}` ledger under the selected backend (`--backend` or `BACKEND`). Their object keys were never recorded, so `done` and `prune` list them by prefix.
 
-The Drive-mounted copy counts as delivered even while Drive for desktop is still uploading in the background. `drive-visible` asks a pluggable check whether the cloud copy has appeared: set `DRIVE_CHECK_CMD` to a command that prints `yes` or `no` (it receives `REVIEW_KIT_DRIVE_NAME` and `REVIEW_KIT_DRIVE_PATH` in its environment). Without a hook the answer is `unknown`:
-
-```bash
-review-kit --profile work drive-visible pa-review-123   # prints yes, no or unknown
-```
-
-Once Drive is visible, delete the temporary Dropbox copy and any storage package:
-
-```bash
-review-kit --profile work cleanup pa-review-123 --dry-run
-review-kit --profile work cleanup pa-review-123                     # runs the Drive check first
-review-kit --profile work cleanup pa-review-123 --drive-confirmed   # already confirmed by hand
-```
-
-`cleanup` refuses to run while the check says `no` or `unknown` unless `--drive-confirmed` is passed. The Dropbox deletion is guarded: only the recorded remote path under `DROPBOX_REMOTE` is purged (`rclone purge`), and only ledger-tracked objects are removed from storage (the `done` rules). Every delivery is recorded in `~/.local/state/review-kit/deliveries.json` (set `DELIVERIES_PATH` to move it); `review-kit deliveries` lists the ones still waiting for cleanup and `--all` shows everything.
+This replaces the earlier `deliver`, `cleanup`, `drive-visible` and `deliveries` commands: use `share`, `share-gc`, `drive-status` and `status`.
 
 ### Board: Miro wireflow layouts
 
@@ -326,12 +347,14 @@ On failure, completed clips are retained with `status: failed` and `ERROR.txt`; 
 ## Tests
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py && python3 test_review_kit.py
+PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py && python3 test_review_kit.py && python3 test_drive_share.py
 ```
 
 On Windows or a different environment, choose a writable cache path or omit the environment assignment. Tests create tiny synthetic inputs and preserve results under `test_artifacts/`. Successful paths use real FFmpeg/ffprobe. Certain oversize, timeout, missing-tool, and validation-failure cases use explicit mocks. Tests cover audio/no audio, delayed/short audio, delayed-video rejection, odd dimensions, portrait, rotation 90, full/limited/unspecified color range (black/white pixel levels checked within ±3), a reproduction of the pre-fix full-range failure, HDR rejection, conflicting color tags, missing FFmpeg filters, one-frame clips, decimal/binary caps, strict size-cap and duration boundaries, silent inputs recorded as audio absent, Korean/space paths, collisions, bounded retries/floors, interruption without DONE, corrupted media, and final-metadata failure without DONE.
 
 `test_review_kit.py` uses a fake backend and no network. It covers mixed Drive/storage INDEX rows, Drive-only packages, ledger cleanup, capacity-based oldest-first pruning, re-signing without package re-upload, `MANIFEST.json` content and refresh, `verify` OK/missing/mismatch/extra, safe object keys, and AWS-published SigV4 signatures.
+
+`test_drive_share.py` uses fake `fileproviderctl`, `ssh`, `rsync` and `rclone` runners and no real Drive mount. It covers upload-state parsing, `--host` over ssh, the Drive and Dropbox backends, the Drive → Dropbox → storage fallback, and `share-gc` dry run, SHA256 matching and capacity pruning.
 
 ## License
 
