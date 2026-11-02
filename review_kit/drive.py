@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import subprocess  # nosec B404 -- argv lists only, never shell=True
+import tempfile
 
 
 UPLOADED = "uploaded"
@@ -183,10 +184,25 @@ def load_hosts(path=None):
     local = data.get("local", {})
     if not isinstance(hosts, dict) or not isinstance(local, dict):
         raise ValueError("hosts.toml: [hosts.<name>] and [local] must be tables")
+    if "local" in hosts:
+        raise ValueError("hosts.toml: [hosts.local] is reserved (--host local is the default "
+                         "host: [local], or the profile's DRIVE_MOUNT_DIR); put its settings "
+                         "under [local] or rename the host")
     return {"local": local, "hosts": hosts, "_path": str(path)}
 
 
 # --- hosts --------------------------------------------------------------------
+
+# A copy in progress lives in a fresh private (0700) directory beside its target:
+# created exclusively under a unique name, so no planted symlink is followed and two
+# copies never share it; hidden, so walks skip it; same filesystem, so the rename is
+# atomic. Only the directory this copy created is removed.
+STAGING_PREFIX = ".review-kit-partial."
+# ssh form of LocalHost.put_file.
+SSH_WRITE_SCRIPT = ('[ ! -d "$1" ] || exit 1; stage=$(mktemp -d "$(dirname "$1")/' + STAGING_PREFIX + 'XXXXXX") || exit 1; '
+                    'cat > "$stage/data" && mv -f "$stage/data" "$1"; '
+                    'status=$?; rm -rf "$stage"; exit $status')
+
 
 class LocalHost:
     """The machine this command runs on."""
@@ -247,9 +263,21 @@ class LocalHost:
             return None
         return digest.hexdigest()
 
+    def listing_root(self):
+        """drive_root as find/walk output spells it (already expanded locally)."""
+        return self.drive_root
+
     def put_file(self, source, target):
-        Path(target).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(str(source), str(target))
+        # Staged and renamed (STAGING_PREFIX), so a failed copy leaves no partial file.
+        target = Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        stage = tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=str(target.parent))
+        try:
+            partial = os.path.join(stage, "data")
+            shutil.copyfile(str(source), partial)
+            os.replace(partial, str(target))
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
 
     def exists(self, path):
         return os.path.lexists(path)
@@ -338,9 +366,10 @@ class SshHost(LocalHost):
         parent, name = str(PurePosixPath(target).parent), PurePosixPath(target).name
         if Path(source).name != name:
             self._checked(["mkdir", "-p", parent])
-            self._checked(["sh", "-c", 'cat > "$1"', "sh", target],
+            self._checked(["sh", "-c", SSH_WRITE_SCRIPT, "sh", target],
                           stdin=Path(source).read_bytes())
             return
+        # rsync writes a temporary file and renames it, and removes it when a copy fails.
         # --rsync-path runs through the remote shell in every rsync version, so the
         # quoted mkdir/cd handle spaces in Drive paths without rsync's own arg escaping.
         quoted = remote_quote(parent)
@@ -351,6 +380,19 @@ class SshHost(LocalHost):
         if code:
             raise RuntimeError("rsync to %s failed (exit %d): %s"
                                % (self.label, code, _short(err)))
+
+    def listing_root(self):
+        """drive_root as remote find prints it: a leading ~ is expanded with the remote
+        $HOME (asked once), since remote_quote expands it for every command."""
+        root = str(self.drive_root)
+        if root != "~" and not root.startswith("~/"):
+            return root
+        if getattr(self, "_home", None) is None:
+            home = _decode(self._checked(["sh", "-c", 'printf "%s" "$HOME"'])).strip()
+            if not home or "\n" in home:
+                raise RuntimeError("could not read $HOME on %s" % self.label)
+            self._home = home.rstrip("/")
+        return self._home + root[1:]
 
     def symlinks(self, paths):
         script = 'for p in "$@"; do if [ -L "$p" ]; then printf "%s\\n" "$p"; fi; done'

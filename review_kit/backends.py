@@ -471,11 +471,14 @@ class DriveBackend:
         '' or '.' is drive_root itself."""
         path = str(path or "").replace("\\", "/").rstrip("/")
         root = str(self.root).replace("\\", "/").rstrip("/")
+        absolute = path.startswith("/") or (len(path) > 1 and path[1] == ":")
+        if absolute and root.startswith("~"):
+            root = str(self.host.listing_root()).rstrip("/")  # an expanded absolute dest
         if path in ("", ".") or path == root:
             return ""
         if path.startswith(root + "/"):
             path = path[len(root) + 1:]
-        elif path.startswith(("/", "~")) or (len(path) > 1 and path[1] == ":"):
+        elif absolute or path.startswith("~"):
             raise ValueError("Drive destination must be under drive_root (%s)" % self.root)
         return readable_key(path)
 
@@ -509,13 +512,15 @@ class DriveBackend:
     def put_file(self, key, path, content_type, digest):
         if self.already_there(key, digest):
             return False
-        self._copy(key, path, digest)
+        self._copy(key, path, digest, new=True)
         return True
 
-    def _copy(self, key, path, digest):
+    def _copy(self, key, path, digest, new=False):
         target = self._target(key)
         self.host.put_file(path, target)
         if self.host.sha256(target) != digest:
+            if new:  # never leave a wrong new file that a retry would see as a conflict
+                self.host.remove([target])
             raise RuntimeError("Drive copy of %s does not match its sha256" % key)
 
     def put_bytes(self, key, data, content_type, digest):
@@ -540,7 +545,7 @@ class DriveBackend:
         return self.path(key)
 
     def list_objects(self, prefix=""):
-        root = str(self.root).replace("\\", "/").rstrip("/") + "/"
+        root = str(self.host.listing_root()).replace("\\", "/").rstrip("/") + "/"
         found = []
         for path, size in self.host.list_sizes(self.path(prefix.strip("/"))):
             path = str(path).replace("\\", "/")
@@ -590,7 +595,7 @@ class DropboxBackend:
 
     def _rclone(self, *args, missing_ok=False):
         code, out, err = self.run(["rclone"] + list(args))
-        if code == 3 and missing_ok:  # rclone: directory not found
+        if code in (3, 4) and missing_ok:  # rclone: directory / file not found
             return None
         if code:
             text = " ".join((err or b"").decode("utf-8", "replace").split())
@@ -668,7 +673,7 @@ class DropboxBackend:
 
     def delete_keys(self, keys):
         for key in keys:
-            self._rclone("deletefile", self._path(key))
+            self._rclone("deletefile", self._path(key), missing_ok=True)
         if keys:
             self.run(["rclone", "rmdirs", "--leave-root", self.remote])
 
