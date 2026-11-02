@@ -183,10 +183,21 @@ def load_hosts(path=None):
     local = data.get("local", {})
     if not isinstance(hosts, dict) or not isinstance(local, dict):
         raise ValueError("hosts.toml: [hosts.<name>] and [local] must be tables")
+    if "local" in hosts:
+        raise ValueError("hosts.toml: [hosts.local] is reserved (--host local is this "
+                         "machine); put its settings under [local] or rename the host")
     return {"local": local, "hosts": hosts, "_path": str(path)}
 
 
 # --- hosts --------------------------------------------------------------------
+
+# A copy in progress: hidden (walks skip dotfiles) and next to its target.
+PARTIAL_NAME = ".%s.review-kit-partial"
+# ssh form of LocalHost.put_file: write a hidden sibling, rename on success.
+SSH_WRITE_SCRIPT = ('partial="$(dirname "$1")/.$(basename "$1").review-kit-partial"; '
+                    'cat > "$partial" && mv -f "$partial" "$1" || '
+                    '{ rm -f "$partial"; exit 1; }')
+
 
 class LocalHost:
     """The machine this command runs on."""
@@ -247,9 +258,22 @@ class LocalHost:
             return None
         return digest.hexdigest()
 
+    def listing_root(self):
+        """drive_root as find/walk output spells it (already expanded locally)."""
+        return self.drive_root
+
     def put_file(self, source, target):
-        Path(target).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(str(source), str(target))
+        # Written beside the target and renamed, so a failed copy leaves no partial file.
+        target = Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_name(PARTIAL_NAME % target.name)
+        try:
+            shutil.copyfile(str(source), str(partial))
+            os.replace(str(partial), str(target))
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(str(partial))
+            raise
 
     def exists(self, path):
         return os.path.lexists(path)
@@ -338,9 +362,10 @@ class SshHost(LocalHost):
         parent, name = str(PurePosixPath(target).parent), PurePosixPath(target).name
         if Path(source).name != name:
             self._checked(["mkdir", "-p", parent])
-            self._checked(["sh", "-c", 'cat > "$1"', "sh", target],
+            self._checked(["sh", "-c", SSH_WRITE_SCRIPT, "sh", target],
                           stdin=Path(source).read_bytes())
             return
+        # rsync writes a temporary file and renames it, and removes it when a copy fails.
         # --rsync-path runs through the remote shell in every rsync version, so the
         # quoted mkdir/cd handle spaces in Drive paths without rsync's own arg escaping.
         quoted = remote_quote(parent)
@@ -351,6 +376,19 @@ class SshHost(LocalHost):
         if code:
             raise RuntimeError("rsync to %s failed (exit %d): %s"
                                % (self.label, code, _short(err)))
+
+    def listing_root(self):
+        """drive_root as remote find prints it: a leading ~ is expanded with the remote
+        $HOME (asked once), since remote_quote expands it for every command."""
+        root = str(self.drive_root)
+        if root != "~" and not root.startswith("~/"):
+            return root
+        if getattr(self, "_home", None) is None:
+            home = _decode(self._checked(["sh", "-c", 'printf "%s" "$HOME"'])).strip()
+            if not home.startswith("/"):
+                raise RuntimeError("could not read $HOME on %s" % self.label)
+            self._home = home.rstrip("/")
+        return self._home + root[1:]
 
     def symlinks(self, paths):
         script = 'for p in "$@"; do if [ -L "$p" ]; then printf "%s\\n" "$p"; fi; done'

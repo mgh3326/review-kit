@@ -49,6 +49,7 @@ class FakeWorld:
         self.dropbox_fails = False
         self.dropbox_full = False
         self.unreadable = set()   # remote paths shasum cannot read
+        self.home = "/home/tester"  # remote $HOME
         self.ssh_down = False
 
     def _evaluate(self, path):
@@ -79,6 +80,10 @@ class FakeWorld:
         if self.ssh_down:
             return 255, b"", b"ssh: connect to host: Connection refused"
         words = shlex.split(command)
+        if words == ["sh", "-c", 'printf "%s" "$HOME"']:
+            return 0, self.home.encode(), b""
+        # remote_quote turns ~/x into "$HOME"/x; the remote shell expands it.
+        words = [w.replace("$HOME", self.home) for w in words]
         if words[:2] == ["fileproviderctl", "evaluate"]:
             return self._evaluate(words[2])
         if words[0] == "find":
@@ -98,8 +103,11 @@ class FakeWorld:
         if words[:2] == ["sh", "-c"] and words[2].startswith('for p in "$@"; do if [ -L'):
             linked = [path for path in words[4:] if os.path.islink(path)]
             return 0, "".join(path + "\n" for path in linked).encode(), b""
-        if words[:2] == ["sh", "-c"] and words[2] == 'cat > "$1"':
-            Path(words[4]).write_bytes(stdin)
+        if words[:2] == ["sh", "-c"] and words[2] == drive.SSH_WRITE_SCRIPT:
+            target = Path(words[4])
+            partial = target.with_name(".%s.review-kit-partial" % target.name)
+            partial.write_bytes(stdin)
+            os.replace(str(partial), str(target))
             return 0, b"", b""
         if words[:3] == ["rm", "-f", "--"]:
             for path in words[3:]:
@@ -136,8 +144,8 @@ class FakeWorld:
                        % (sorted(self.dropbox).index(args[1]))).encode(), b""
         elif verb == "hashsum":
             data = self.dropbox.get(args[3])
-            if data is None:
-                return 3, b"", b"directory not found"
+            if data is None:  # rclone: exit 4, file not found
+                return 4, b"", b"error: object not found"
             return 0, ("%s  x\n" % hashlib.sha256(data).hexdigest()).encode(), b""
         elif verb == "lsjson":
             root = args[3].rstrip("/") + "/"
@@ -147,7 +155,8 @@ class FakeWorld:
                 return 3, b"", b"directory not found"
             return 0, json.dumps(items).encode(), b""
         elif verb == "deletefile":
-            del self.dropbox[args[1]]
+            if self.dropbox.pop(args[1], None) is None:
+                return 4, b"", b"error: object not found"
         elif verb != "rmdirs":
             raise AssertionError("unexpected rclone %r" % args)
         return 0, b"", b""
@@ -454,6 +463,56 @@ class BackendTests(Base):
         digest = hashlib.sha256(b"b").hexdigest()
         self.world.dropbox[earlier] = b"b"
         self.assertFalse(backend.put_file("pkg/b.txt", folder / "b.txt", "text/plain", digest))
+
+    def test_failed_drive_copy_leaves_no_partial_or_wrong_file(self):
+        backend = create_backend(self.config, "drive", run=self.world, hosts=self.hosts)
+        data = b"complete bytes"
+        digest = hashlib.sha256(data).hexdigest()
+        target = self.drive_root / "reviews" / "clip.mp4"
+
+        def disk_full(source, destination):
+            Path(destination).write_bytes(b"compl")
+            raise OSError("No space left on device")
+
+        with mock.patch.object(drive.shutil, "copyfile", side_effect=disk_full):
+            with self.assertRaisesRegex(OSError, "No space"):
+                backend.put_bytes("reviews/clip.mp4", data, "video/mp4", digest)
+        self.assertEqual(sorted(os.listdir(str(target.parent))), [])
+
+        def wrong_bytes(source, destination):
+            Path(destination).write_bytes(b"other")
+
+        with mock.patch.object(drive.LocalHost, "put_file", side_effect=wrong_bytes):
+            with self.assertRaisesRegex(RuntimeError, "does not match its sha256"):
+                backend.put_bytes("reviews/clip.mp4", data, "video/mp4", digest)
+        self.assertFalse(target.exists())
+        # A retry is not blocked by a leftover "conflict".
+        self.assertTrue(backend.put_bytes("reviews/clip.mp4", data, "video/mp4", digest))
+        self.assertEqual(target.read_bytes(), data)
+
+    def test_ssh_drive_root_with_tilde_lists_and_resolves(self):
+        self.world.home = self.root.as_posix()
+        self.hosts["hosts"]["mount"]["drive_root"] = "~/remote-drive"
+        backend = create_backend(self.config, "drive", run=self.world, hosts=self.hosts,
+                                 host="mount")
+        data = b"bytes"
+        self.assertTrue(backend.put_bytes("reviews/INDEX.md", data, "text/markdown",
+                                          hashlib.sha256(data).hexdigest()))
+        self.assertEqual((self.remote_root / "reviews" / "INDEX.md").read_bytes(), data)
+        self.assertEqual(backend.list_objects("reviews"), [("reviews/INDEX.md", 5)])
+        self.assertEqual(backend.relative((self.remote_root / "reviews").as_posix()), "reviews")
+
+    def test_dropbox_missing_file_is_a_miss_not_an_error(self):
+        backend = DropboxBackend(self.config, run=self.world)
+        self.assertIsNone(backend.object_sha256("pkg/never.txt"))
+        backend.delete_keys(["pkg/never.txt"])  # already gone: nothing to do
+
+    def test_hosts_local_is_reserved(self):
+        config = self.root / "hosts.toml"
+        config.write_text('[hosts.local]\nssh = "someone@mount-host.invalid"\n',
+                          encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, r"\[hosts.local\] is reserved"):
+            drive.load_hosts(config)
 
     def test_dropbox_resign_rewrites_index(self):
         backend = DropboxBackend(self.config, run=self.world)
