@@ -1,0 +1,22 @@
+version: 1
+# Operator-desk 2026-11-02: modelled on fillwire; auto-merge (land) on; blocking paths still get two review passes.
+enabled: true
+required_checks:
+  - test (ubuntu-latest, 3.9)
+  - test (ubuntu-latest, 3.12)
+  - test (ubuntu-latest, 3.14)
+  - test (macos-latest, 3.9)
+  - test (macos-latest, 3.12)
+  - test (macos-latest, 3.14)
+  - test (windows-latest, 3.9)
+  - test (windows-latest, 3.12)
+  - test (windows-latest, 3.14)
+blocking:
+  - paths: ['review_kit/share.py', 'review_kit/backends.py']
+    reason: done, prune and share-gc delete Drive, Dropbox and storage copies that reviewers may still need.
+  - paths: ['.github/workflows/**', '.mergewake/**', 'pyproject.toml', 'setup.py']
+    reason: Verification, packaging and policy changes can bypass recovery controls.
+review_gate:
+  land: graded
+fast_lane:
+  max_changed_lines: 50
