@@ -57,7 +57,9 @@ class FakeWorld:
         root = words[1]
         if not os.path.exists(root):
             return 1, b"", b"No such file"
-        found = [root] if os.path.isfile(root) else walk_files(root)
+        # Like macOS find: '/'-separated paths even when the fake runs on Windows.
+        found = [root] if os.path.isfile(root) else [p.replace(os.sep, "/")
+                                                    for p in walk_files(root)]
         if "-exec" in words:
             return 0, "".join("%d %s\n" % (os.path.getsize(p), p) for p in found).encode(), b""
         return 0, "".join(p + "\n" for p in found).encode(), b""
