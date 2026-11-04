@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create size-limited, independently decodable review clips. Python 3.9+, FFmpeg."""
+"""Create size-limited, independently decodable review clips. Python 3.10+, FFmpeg."""
 import argparse
 import csv
 import hashlib

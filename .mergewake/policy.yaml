@@ -2,13 +2,13 @@ version: 1
 # Operator 2026-11-02: review-kit joins the mergewake daemon; auto-merge (land) on.
 enabled: true
 required_checks:
-  - test (ubuntu-latest, 3.9)
+  - test (ubuntu-latest, 3.10)
   - test (ubuntu-latest, 3.12)
   - test (ubuntu-latest, 3.14)
-  - test (macos-latest, 3.9)
+  - test (macos-latest, 3.10)
   - test (macos-latest, 3.12)
   - test (macos-latest, 3.14)
-  - test (windows-latest, 3.9)
+  - test (windows-latest, 3.10)
   - test (windows-latest, 3.12)
   - test (windows-latest, 3.14)
 blocking:
