@@ -6,7 +6,7 @@ Prepare, package, and share review material. `prep_video.py` remains available f
 
 ## Requirements
 
-- Python 3.9 or newer, standard library only.
+- Python 3.10 or newer, standard library only.
 - `ffmpeg` and `ffprobe` are needed only when preparing videos. They must be on PATH with libx264 and AAC encoders and the `scale` (with `in_range`/`out_range`), `setsar`, `fps`, `format`, and `setparams` filters. Encoding is always software libx264.
 - For video output, a local filesystem supporting hard links for atomic, no-overwrite finalization.
 - Node (version in `site/.nvmrc`) and `npm ci --prefix site` are needed only for `review-kit site`, the way FFmpeg is needed only for video. `site build` also uses the `handoffkeep` CLI (or `HANDOFFKEEP_URL` + `HANDOFFKEEP_TOKEN`), `gh` and `git` for the sources it reads. Every other command stays Python standard library only.
@@ -16,8 +16,8 @@ Sharing uses the Python standard library and does not need FFmpeg. Configure a p
 OS support — exactly what has been verified:
 
 - **macOS Apple Silicon (arm64): tests pass locally** with the color-range fix — macOS 27.0.1, Python 3.14.7, FFmpeg/ffprobe 9.0.2 (Homebrew). A real 245.7 s full-range (`yuvj420p`/`pc`, BT.709, rotation 90) HEVC screen recording was also processed end to end into 3 validated clips.
-- **macOS Intel (x86_64): not yet re-verified with the color-range fix.** Earlier code (before the fix) passed tests on macOS 26.6.2, Python 3.9.6, FFmpeg/ffprobe 8.1. CI's `macos-latest` runner is Apple Silicon, so CI does not cover Intel.
-- **CI: all 9 matrix jobs green** in run [39414034940](https://github.com/mgh3326/review-kit/actions/runs/39414034940) on ubuntu-latest, macos-latest, and windows-latest × Python 3.9, 3.12, and 3.14 (`.github/workflows/ci.yml`).
+- **macOS Intel (x86_64): not yet re-verified with the color-range fix.** Earlier code (before the fix) passed tests on macOS 26.6.2, Python 3.9.6, FFmpeg/ffprobe 8.1; Python 3.9 is no longer supported, so Intel has not been verified on a supported Python. CI's `macos-latest` runner is Apple Silicon, so CI does not cover Intel.
+- **CI:** ubuntu-latest, macos-latest, and windows-latest × Python 3.10, 3.12 and 3.14, 9 jobs; 3.10 is the declared minimum (`.github/workflows/ci.yml`). Python 3.9 was dropped after it reached end of life in October 2025. The last all-green run of the earlier matrix, which included Python 3.9, is [41421222876](https://github.com/mgh3326/review-kit/actions/runs/41421222876).
 
 FFmpeg/ffprobe are external runtime dependencies for video preparation: they are not bundled with and are not installed by this project. FFmpeg needs libx264 and AAC encoders. Upload and signing use the standard library and require a configured storage account.
 
