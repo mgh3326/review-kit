@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import subprocess
@@ -256,12 +257,18 @@ def check_deploy_config(config):
 
     Both flags must be literally false: wrangler turns workers.dev on when
     the key is absent, and preview URLs follow it. Every env.<name> block is
-    checked too, since `wrangler deploy --env` would apply it.
+    checked too, since `wrangler deploy --env` would apply it. Exactly one
+    route may exist and it must be the custom_domain route: a plain `route`,
+    a second `routes` entry or a second custom domain serves the snapshot on
+    a hostname outside the Access-protected domain.
     """
     if not isinstance(config, dict):
         raise ValueError("deploy config must be a JSON object")
+    env = config.get("env")
+    if env is not None and not isinstance(env, dict):
+        raise ValueError("Refusing to deploy: env must be an object of named blocks")
     scopes = [("top level", config)]
-    for name, block in sorted((config.get("env") or {}).items()):
+    for name, block in sorted((env or {}).items()):
         scopes.append(("env.%s" % name, block if isinstance(block, dict) else {}))
     problems = []
     for where, block in scopes:
@@ -276,11 +283,29 @@ def check_deploy_config(config):
     if problems:
         raise ValueError("Refusing to deploy: %s. A workers.dev or preview URL serves the "
                          "snapshot without Cloudflare Access." % "; ".join(problems))
-    urls = ["https://%s/" % r["pattern"].strip("/") for r in config.get("routes") or []
-            if isinstance(r, dict) and r.get("custom_domain") and r.get("pattern")]
+    urls, others = [], []
+    for where, block in scopes:
+        for key in ("route", "routes"):
+            value = block.get(key)
+            if not value:
+                continue
+            for route in value if isinstance(value, list) else [value]:
+                if (isinstance(route, dict) and route.get("custom_domain") is True
+                        and isinstance(route.get("pattern"), str)
+                        and route["pattern"].strip("/")):
+                    urls.append("https://%s/" % route["pattern"].strip("/"))
+                else:
+                    others.append("%s %s %s is not a custom_domain route" % (
+                        where, key, json.dumps(route)))
+    if others:
+        raise ValueError("Refusing to deploy: %s. Only the Access-protected custom_domain "
+                         "route may serve the snapshot." % "; ".join(others))
     if not urls:
         raise ValueError("Refusing to deploy: no custom_domain route; the site must be "
                          "reachable only on its Access-protected domain")
+    if len(urls) > 1:
+        raise ValueError("Refusing to deploy: %s are custom_domain routes. The snapshot may "
+                         "be served on one Access-protected domain only." % ", ".join(urls))
     return urls
 
 
@@ -299,7 +324,14 @@ def deploy(directory, site=None, config_path=None, dry_run=False, env=None,
     snapshot = json.loads((directory / "snapshot.json").read_text(encoding="utf-8"))
     config = dict(config)
     config.pop("$schema", None)
-    config["assets"] = dict(config.get("assets") or {}, directory=str(directory))
+    assets = config.get("assets")
+    if isinstance(assets, str):
+        assets = {"directory": assets}  # wrangler.jsonc also allows the string form
+    elif assets is None:
+        assets = {}
+    elif not isinstance(assets, dict):
+        raise ValueError("Refusing to deploy: assets must be an object or a directory string")
+    config["assets"] = dict(assets, directory=str(directory))
     account = env.get("CLOUDFLARE_ACCOUNT_ID") or config.get("account_id")
     plan = {"worker": config.get("name"), "urls": urls, "assets": str(directory),
             "snapshot": snapshot.get("snapshot"), "account": "set" if account else "missing"}
@@ -337,10 +369,12 @@ BUNDLE_README = """# Review snapshot (markdown)
 This folder is the markdown export of a static review snapshot. It was read
 from hk, GitHub and git at the time above and is not kept in sync.
 
-- `llms.txt`: page index; its links are paths from this folder's root.
+- `llms.txt`: page index.
 - `llms-full.txt`: every page in one file.
 - `pages/`: one markdown file per page, plus `llms.txt` per section.
 - `snapshot.json`: time, inputs, page list and counts.
+
+Links in these files are relative to the file that holds them.
 """
 
 
@@ -353,24 +387,28 @@ def bundle(directory, out):
     out = _new_dir(out, "Bundle directory")
     out.mkdir()
     (out / "pages").mkdir()
-    copied = []
+    pages, copies = [], []
     for source in sorted(directory.rglob("index.md")):
         rel = source.parent.relative_to(directory).as_posix()
         target = out / "pages" / ((rel if rel != "." else "index") + ".md")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(str(source), str(target))
-        copied.append(target.relative_to(out).as_posix())
-    if not copied:
+        pages.append((source, target, "" if rel == "." else rel))
+    if not pages:
         raise ValueError("%s has no index.md pages to bundle" % directory)
-    site_url = (manifest.get("site_url") or "").rstrip("/")
+    copies += pages
     for source in sorted(directory.rglob("llms.txt")):
         rel = source.parent.relative_to(directory).as_posix()
         target = out / "llms.txt" if rel == "." else out / "pages" / rel / "llms.txt"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        text = source.read_text(encoding="utf-8")
-        target.write_text(_local_links(text, site_url) if site_url else text, encoding="utf-8")
+        copies.append((source, target, "llms.txt" if rel == "." else rel + "/llms.txt"))
     if (directory / "llms-full.txt").is_file():
-        shutil.copyfile(str(directory / "llms-full.txt"), str(out / "llms-full.txt"))
+        copies.append((directory / "llms-full.txt", out / "llms-full.txt", "llms-full.txt"))
+    site_url = (manifest.get("site_url") or "").rstrip("/")
+    targets = {key: target.relative_to(out).as_posix() for _, target, key in copies}
+    for source, target, _ in copies:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_local_links(source.read_text(encoding="utf-8"), site_url, targets,
+                                       target.parent.relative_to(out).as_posix()),
+                          encoding="utf-8")
+    copied = [target.relative_to(out).as_posix() for _, target, _ in pages]
     shutil.copyfile(str(manifest_path), str(out / "snapshot.json"))
     project = manifest.get("project")
     (out / "README.md").write_text(BUNDLE_README.format(
@@ -380,9 +418,33 @@ def bundle(directory, out):
     return out, copied
 
 
-def _local_links(text, origin):
-    """Point page and section links at the bundle's own files (paths from its root)."""
-    pages = re.compile(re.escape(origin) + r"/((?:[^\s)]*/)?)index\.md")
-    text = pages.sub(lambda m: "pages/%s.md" % (m.group(1).rstrip("/") or "index"), text)
-    sections = re.compile(re.escape(origin) + r"/([^\s)]+/)llms\.txt")
-    return sections.sub(lambda m: "pages/%sllms.txt" % m.group(1), text)
+LINK_TARGET = re.compile(r"\]\(([^()\s]+)\)")
+
+
+def _local_links(text, origin, targets, base="."):
+    """Point page and section links at the bundle's own files, relative to `base`.
+
+    Pages carry site-root links (``/tasks/2002/``) and origin-absolute ones
+    (``https://.../tasks/2002/``); a reader of the export cannot reach the
+    Access-protected origin, so both become paths from the file's own folder.
+    """
+
+    def swap(match):
+        raw = match.group(1)
+        if origin and (raw == origin or raw.startswith(origin + "/")):
+            path = raw[len(origin):] or "/"
+        elif raw.startswith("/") and not raw.startswith("//"):
+            path = raw
+        else:
+            return match.group(0)  # external, already relative, or an anchor
+        key = path.strip("/")
+        if key.endswith("/index.md"):
+            key = key[:-len("/index.md")]
+        elif key == "index.md":
+            key = ""
+        target = targets.get(key)
+        if not target:
+            return match.group(0)  # not a file this bundle holds
+        return "](%s)" % posixpath.relpath(target, base)
+
+    return LINK_TARGET.sub(swap, text)

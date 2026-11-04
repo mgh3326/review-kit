@@ -287,9 +287,9 @@ review-kit share ./snap-fleet-md reviews/snap-fleet   # Access를 못 통과하�
 - 읽기 전용입니다. `handoffkeep` CLI(또는 `HANDOFFKEEP_URL`+`HANDOFFKEEP_TOKEN`의 `GET /v1/...`), `gh pr list`, 로컬 `git`(fetch 없음). `--save-data`로 입력을 저장하고 `--from-data`로 오프라인 빌드합니다. `curated.json`(요약·추가 페이지·항목별 질문/권고)은 선택입니다.
 - 빌드마다 Astro 캐시(`.astro`, `node_modules/.astro`, `.vite`, `dist`)와 생성 콘텐츠를 지운 뒤 production 빌드를 돌리고, 출력에 `snapshot.json`(시각·입력·페이지 목록·건수, 토큰 없음)을 씁니다. 에이전트가 쓴 글의 MDX `{…}`·`<…>`·`import`/`export`·링크·`:::`는 모두 이스케이프됩니다.
 
-`site deploy DIR`은 `CLOUDFLARE_API_TOKEN`과 계정 id(`CLOUDFLARE_ACCOUNT_ID` 또는 설정의 `account_id`)로 배포하고 URL과 version id를 출력합니다. `workers_dev`와 `preview_urls`가 최상위와 모든 `env.*`에서 정확히 `false`가 아니거나 custom domain 경로가 없으면 **배포를 거부**합니다. `*.workers.dev`·preview 주소는 Access를 우회하기 때문입니다. `--dry-run`은 토큰 없이 설정만 검사합니다.
+`site deploy DIR`은 `CLOUDFLARE_API_TOKEN`과 계정 id(`CLOUDFLARE_ACCOUNT_ID` 또는 설정의 `account_id`)로 배포하고 URL과 version id를 출력합니다. `workers_dev`와 `preview_urls`가 최상위와 모든 `env.*`에서 정확히 `false`가 아니거나 custom domain 경로가 아닌 경로가 있으면 **배포를 거부**합니다. `*.workers.dev`·preview 주소는 Access를 우회하기 때문입니다. `--dry-run`은 토큰 없이 설정만 검사합니다.
 
-`site bundle DIR --out OUT`은 마크다운 내보내기(`llms.txt`(링크를 번들 안 파일로 바꿈), `llms-full.txt`, 페이지별 `pages/**.md`, `snapshot.json`, `README.md`)를 `review-kit share`로 보낼 폴더로 만듭니다.
+`site bundle DIR --out OUT`은 마크다운 내보내기(`llms.txt`, `llms-full.txt`, 페이지별 `pages/**.md`, `snapshot.json`, `README.md`)를 `review-kit share`로 보낼 폴더로 만듭니다. 모든 마크다운 파일의 링크는 그 파일 기준 상대 경로로 번들 안 파일을 가리킵니다.
 
 ## 빠른 시작
 

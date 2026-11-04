@@ -79,9 +79,11 @@ class Context:
         return parse_time(value).astimezone(self.now.tzinfo)
 
     def stamp(self, value):
-        return self.local(value).strftime("%Y-%m-%d %H:%M")
+        return self.local(value).strftime("%Y-%m-%d %H:%M") if value else "?"
 
     def age(self, value):
+        if not value:
+            return "?"
         seconds = max(0, (self.now - parse_time(value)).total_seconds())
         if seconds < 3600:
             return "%d분" % (seconds // 60)
@@ -574,8 +576,10 @@ def _task_page(ctx, task, reason, ask, link):
         ["원본", "hk task %d" % task["id"]],
         ["프로젝트 · 레인", M.inline("%s · %s" % (project_of(task), task.get("lane")))],
         ["종류 · 상태", M.inline("%s · %s" % (task.get("kind"), task["state"]))],
-        ["만든 시각", "%s (%s 전)" % (ctx.stamp(task["created_at"]), ctx.age(task["created_at"]))],
-        ["hk updated_at", ctx.stamp(task["updated_at"])],
+        ["만든 시각", "%s (%s 전)" % (ctx.stamp(task.get("created_at")),
+                                     ctx.age(task.get("created_at")))
+         if task.get("created_at") else "?"],
+        ["hk updated_at", ctx.stamp(task.get("updated_at"))],
         ["선정 이유", M.inline(reason)],
         ["스냅샷", ctx.snap]])
     body = [_ask_box(ask, link), meta, "## 원래 제목", "", _one_line(task["title"], link), "",

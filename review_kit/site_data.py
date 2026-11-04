@@ -95,7 +95,16 @@ def load(directory):
     tasks = read("tasks.json", {"tasks": []})
     if not isinstance(tasks, dict) or not isinstance(tasks.get("tasks"), list):
         raise ValueError("tasks.json must be an object with a tasks list")
-    comments = {int(k): v for k, v in read("comments.json", {}).items()}
+    raw_comments = read("comments.json", {})
+    if not isinstance(raw_comments, dict):
+        raise ValueError("comments.json must be an object keyed by task id")
+    by_key = {str(t.get("id")): t.get("id") for t in tasks["tasks"]}
+    comments = {}
+    for key, value in raw_comments.items():
+        if str(key) not in by_key:
+            raise ValueError("comments.json has comments for %r, which is not a task in "
+                             "tasks.json" % key)
+        comments[by_key[str(key)]] = value
     return SnapshotData(parse_time(meta["taken_at"]), meta.get("sources", {}),
                         tasks["tasks"], comments, read("docs.json", {}), read("prs.json", {}),
                         read("branches.json", []))
@@ -254,6 +263,10 @@ def fetch_branches(checkout, runner=_run):
         base = git("rev-parse", "--abbrev-ref", "origin/HEAD").strip()
     except RuntimeError:
         base = "origin/main"
+    try:
+        git("rev-parse", "--verify", "--quiet", base)
+    except RuntimeError:
+        return []  # no default branch to compare against (a checkout without origin)
     try:
         remote = git("remote", "get-url", "origin").strip()
         name = re.sub(r"\.git$", "", re.split(r"[/:]", remote)[-1])

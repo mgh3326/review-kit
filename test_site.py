@@ -295,6 +295,37 @@ class DataTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 site_data.load(tmp)
 
+    def test_load_rejects_comments_for_tasks_it_does_not_have(self):
+        data = fixture("decisions")
+        with tempfile.TemporaryDirectory() as tmp:
+            data.save(Path(tmp) / "copy")
+            path = Path(tmp) / "copy" / "comments.json"
+            comments = json.loads(path.read_text(encoding="utf-8"))
+            for key in ("9999", "gone"):
+                path.write_text(json.dumps(dict(comments, **{key: []})), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "not a task in tasks.json"):
+                    site_data.load(Path(tmp) / "copy")
+
+    def test_load_keys_comments_by_the_task_id_it_stored(self):
+        data = fixture("decisions")
+        data.tasks[0]["id"] = "2001"  # ids as strings, as a JSON API may return them
+        with tempfile.TemporaryDirectory() as tmp:
+            data.save(Path(tmp) / "copy")
+            again = site_data.load(Path(tmp) / "copy")
+        self.assertTrue(set(again.comments) <= {t["id"] for t in again.tasks})
+        self.assertIn("2001", again.comments)
+        self.assertNotIn(2001, again.comments)
+
+    def test_branches_without_origin_are_empty_not_an_error(self):
+        def git(argv):
+            if argv[3] == "rev-list":
+                raise RuntimeError("fatal: bad revision 'origin/main..wk/x'")
+            if argv[3] in ("rev-parse", "remote"):
+                raise RuntimeError("git %s failed" % argv[3])
+            return "wk/x\t2026-11-03T00:00:00+09:00\tWIP\n"
+
+        self.assertEqual(site_data.fetch_branches("/tmp/x", runner=git), [])
+
 
 class PagesTest(unittest.TestCase):
     def test_fleet_pages_and_counts(self):
@@ -378,6 +409,15 @@ class PagesTest(unittest.TestCase):
             pages, _, _ = site_pages.generate(kind, fixture(kind), None)
             self.assertTrue(pages)
 
+    def test_decisions_survive_a_task_without_timestamps(self):
+        data = fixture("decisions")
+        thin = next(t for t in data.tasks if t["id"] == 2001)
+        thin["created_at"] = thin["updated_at"] = None  # what _task() gives a thin record
+        pages, _, _ = site_pages.generate("decisions", data, curated("decisions"))
+        page = {p.slug: p for p in pages}["tasks/2001"].render()
+        self.assertIn("| 만든 시각 | ? |", page)
+        self.assertIn("| hk updated_at | ? |", page)
+
 
 GOOD_CONFIG = """// comment with "quotes" and a URL https://x.test/
 {
@@ -454,6 +494,28 @@ class DeployGuardTest(unittest.TestCase):
             site.check_deploy_config(dict(base, routes=[{"pattern": "x.test/*",
                                                          "zone_name": "x.test"}]))
 
+    def test_refuses_any_route_but_the_custom_domain(self):
+        base = site.parse_jsonc(GOOD_CONFIG)
+        good = {"pattern": "review.example.test", "custom_domain": True}
+        plain = {"pattern": "review.example.test/*", "zone_name": "example.test"}
+        for extra in ({"routes": [good, plain]}, {"route": "review.example.test/*"},
+                      {"routes": [good, "review.example.test/*"]},
+                      {"routes": [{"pattern": "review.example.test",
+                                   "custom_domain": "true"}]},
+                      {"env": {"staging": {"routes": [plain]}}}):
+            with self.assertRaisesRegex(ValueError, "custom_domain"):
+                site.check_deploy_config(dict(base, **extra))
+        with self.assertRaisesRegex(ValueError, "one Access-protected domain only"):
+            site.check_deploy_config(dict(base, routes=[good, dict(good,
+                                                                   pattern="other.test")]))
+        self.assertEqual(site.check_deploy_config(base), ["https://review.example.test/"])
+
+    def test_refuses_a_non_object_env(self):
+        base = site.parse_jsonc(GOOD_CONFIG)
+        for value in ("staging", ["staging"], 3):
+            with self.assertRaisesRegex(ValueError, "env must be an object"):
+                site.check_deploy_config(dict(base, env=value))
+
     def test_deploy_never_runs_wrangler_on_a_refused_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = fake_site(Path(tmp) / "site")
@@ -510,6 +572,23 @@ class DeployGuardTest(unittest.TestCase):
             root = fake_site(Path(tmp) / "site")
             with self.assertRaisesRegex(ValueError, "not a built snapshot"):
                 site.deploy(tmp, site=root, dry_run=True, env={})
+
+    def test_deploy_normalises_a_string_assets_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = fake_site(Path(tmp) / "site")
+            (root / "wrangler.jsonc").write_text(
+                GOOD_CONFIG.replace('"assets": { "directory": "./dist", },',
+                                    '"assets": "./dist",'), encoding="utf-8")
+            snap = fake_snapshot(Path(tmp) / "snap")
+            seen = {}
+
+            def runner(argv, **kwargs):
+                seen["config"] = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+                return Done()
+            with mock.patch("sys.stderr", io.StringIO()):
+                site.deploy(snap, site=root, runner=runner,
+                            env={"CLOUDFLARE_API_TOKEN": "t", "CLOUDFLARE_ACCOUNT_ID": "a"})
+        self.assertEqual(seen["config"]["assets"], {"directory": str(snap.resolve())})
 
 
 class BuildTest(unittest.TestCase):
@@ -593,7 +672,7 @@ class BundleTest(unittest.TestCase):
             self.assertEqual((out / "llms.txt").read_text(encoding="utf-8"),
                              "- [Home](pages/index.md)\n- [Tasks](pages/tasks/llms.txt)\n")
             self.assertEqual((out / "pages" / "tasks" / "llms.txt").read_text(encoding="utf-8"),
-                             "- [T](pages/tasks/7.md)\n")
+                             "- [T](7.md)\n")  # relative to the file that holds the link
             self.assertIn(SNAP, (out / "README.md").read_text(encoding="utf-8"))
             names = {p.name for p in out.rglob("*")}
             self.assertFalse({"INDEX.md", "MANIFEST.json"} & names)  # reserved by share
@@ -604,6 +683,31 @@ class BundleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError, "snapshot.json"):
                 site.bundle(tmp, Path(tmp) / "b")
+
+    def test_bundle_rewrites_links_in_pages_and_llms_full(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp) / "dist"
+            for rel in ("tasks/7", "tasks/2002", "hk/research/x"):
+                (dist / rel).mkdir(parents=True)
+                (dist / rel / "index.md").write_text("# page", encoding="utf-8")
+            (dist / "index.md").write_text("# home", encoding="utf-8")
+            (dist / "tasks" / "7" / "index.md").write_text(
+                "- [hk 2002](/tasks/2002/)\n- [home](https://r.test/)\n"
+                "- [doc](https://r.test/hk/research/x/)\n- [ext](https://example.test/a)\n",
+                encoding="utf-8")
+            (dist / "llms-full.txt").write_text("- [task](https://r.test/tasks/7/)\n",
+                                               encoding="utf-8")
+            (dist / "snapshot.json").write_text(json.dumps(
+                {"snapshot": SNAP, "kind": "decisions", "site_url": "https://r.test"}),
+                encoding="utf-8")
+            out, _ = site.bundle(dist, Path(tmp) / "bundle")
+            page = (out / "pages" / "tasks" / "7.md").read_text(encoding="utf-8")
+            full = (out / "llms-full.txt").read_text(encoding="utf-8")
+        self.assertIn("[hk 2002](2002.md)", page)  # same folder: relative to the page file
+        self.assertIn("[home](../index.md)", page)
+        self.assertIn("[doc](../hk/research/x.md)", page)
+        self.assertIn("[ext](https://example.test/a)", page)  # external links stay as they are
+        self.assertIn("[task](pages/tasks/7.md)", full)
 
 
 class CliTest(unittest.TestCase):
