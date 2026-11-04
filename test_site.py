@@ -306,15 +306,34 @@ class DataTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "not a task in tasks.json"):
                     site_data.load(Path(tmp) / "copy")
 
-    def test_load_keys_comments_by_the_task_id_it_stored(self):
+    def test_load_normalises_string_task_ids(self):
         data = fixture("decisions")
-        data.tasks[0]["id"] = "2001"  # ids as strings, as a JSON API may return them
+        for task in data.tasks:
+            task["id"] = str(task["id"])  # ids as strings, as a JSON API may return them
         with tempfile.TemporaryDirectory() as tmp:
             data.save(Path(tmp) / "copy")
             again = site_data.load(Path(tmp) / "copy")
+        self.assertEqual([t["id"] for t in again.tasks], [2001, 2002, 2003, 2004, 2005])
         self.assertTrue(set(again.comments) <= {t["id"] for t in again.tasks})
-        self.assertIn("2001", again.comments)
-        self.assertNotIn(2001, again.comments)
+        self.assertIn(2001, again.comments)
+
+    def test_load_refuses_a_task_id_that_is_not_an_integer(self):
+        data = fixture("decisions")
+        with tempfile.TemporaryDirectory() as tmp:
+            data.save(Path(tmp) / "copy")
+            path = Path(tmp) / "copy" / "tasks.json"
+            tasks = json.loads(path.read_text(encoding="utf-8"))
+            tasks["tasks"][0]["id"] = "wk/2001"
+            path.write_text(json.dumps(tasks), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "not an integer"):
+                site_data.load(Path(tmp) / "copy")
+
+    def test_task_ids_are_integers_from_every_source(self):
+        self.assertEqual(site_data._task({"id": "42", "title": "x"})["id"], 42)
+        self.assertEqual(site_data._task({"id": 42})["id"], 42)
+        for value in ("wk/42", None, 4.2, True):
+            with self.assertRaisesRegex(ValueError, "not an integer"):
+                site_data._task({"id": value})
 
     def test_branches_without_origin_are_empty_not_an_error(self):
         def git(argv):
@@ -418,6 +437,19 @@ class PagesTest(unittest.TestCase):
         self.assertIn("| 만든 시각 | ? |", page)
         self.assertIn("| hk updated_at | ? |", page)
 
+    def test_decisions_build_from_saved_data_with_string_task_ids(self):
+        data = fixture("decisions")
+        for task in data.tasks:
+            task["id"] = str(task["id"])
+        with tempfile.TemporaryDirectory() as tmp:
+            data.save(Path(tmp) / "saved")
+            pages, counts, _ = site_pages.generate("decisions",
+                                                  site_data.load(Path(tmp) / "saved"),
+                                                  curated("decisions"))
+        by_slug = {p.slug: p for p in pages}
+        self.assertEqual(counts["tasks"], 4)
+        self.assertIn("hk task 2001", by_slug["tasks/2001"].render())
+
 
 GOOD_CONFIG = """// comment with "quotes" and a URL https://x.test/
 {
@@ -466,6 +498,7 @@ class DeployGuardTest(unittest.TestCase):
     def test_repo_config_passes_the_guard(self):
         config = site.parse_jsonc((ROOT / "site" / "wrangler.jsonc").read_text(encoding="utf-8"))
         self.assertEqual(site.check_deploy_config(config), ["https://review.robinco.dev/"])
+        self.assertEqual(site.approved_routes(ROOT / "site"), ["https://review.robinco.dev/"])
         self.assertNotIn("account_id", config)
 
     def test_refuses_anything_but_literal_false(self):
@@ -515,6 +548,31 @@ class DeployGuardTest(unittest.TestCase):
         for value in ("staging", ["staging"], 3):
             with self.assertRaisesRegex(ValueError, "env must be an object"):
                 site.check_deploy_config(dict(base, env=value))
+
+    def test_refuses_a_domain_the_checkout_does_not_approve(self):
+        base = site.parse_jsonc(GOOD_CONFIG)
+        with self.assertRaisesRegex(ValueError, "not a custom domain this checkout approves"):
+            site.check_deploy_config(base, approved=["https://elsewhere.test/"])
+        self.assertEqual(site.check_deploy_config(base, approved=["https://review.example.test/"]),
+                         ["https://review.example.test/"])
+
+    def test_deploy_refuses_a_config_that_moves_the_snapshot_to_another_domain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = fake_site(Path(tmp) / "site")
+            snap = fake_snapshot(Path(tmp) / "snap")
+            other = Path(tmp) / "other.jsonc"
+            other.write_text(GOOD_CONFIG.replace("review.example.test", "elsewhere.test"),
+                             encoding="utf-8")
+            runner = mock.Mock(return_value=Done(stdout="Current Version ID: "
+                                                 "0f1e2d3c-aaaa-bbbb-cccc-111122223333\n"))
+            with self.assertRaisesRegex(ValueError, "not a custom domain this checkout approves"):
+                site.deploy(snap, site=root, config_path=other, runner=runner,
+                            env={"CLOUDFLARE_API_TOKEN": "t", "CLOUDFLARE_ACCOUNT_ID": "a"})
+            runner.assert_not_called()
+            same = Path(tmp) / "same.jsonc"
+            same.write_text(GOOD_CONFIG, encoding="utf-8")
+            plan = site.deploy(snap, site=root, config_path=same, dry_run=True, env={})
+        self.assertEqual(plan["urls"], ["https://review.example.test/"])
 
     def test_deploy_never_runs_wrangler_on_a_refused_config(self):
         with tempfile.TemporaryDirectory() as tmp:

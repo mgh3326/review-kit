@@ -252,7 +252,41 @@ def parse_jsonc(text):
         raise ValueError("config is not valid JSONC: %s" % exc)
 
 
-def check_deploy_config(config):
+def _custom_url(route):
+    """The URL of a custom_domain route, or None for any other route."""
+    if (isinstance(route, dict) and route.get("custom_domain") is True
+            and isinstance(route.get("pattern"), str) and route["pattern"].strip("/")):
+        return "https://%s/" % route["pattern"].strip("/")
+    return None
+
+
+def approved_routes(site):
+    """The custom_domain routes the checkout itself approves, from site/wrangler.jsonc.
+
+    The approved domain is the one the reviewed config ships. `--wrangler-config`
+    may change flags, assets and account, but not the hostname that serves the
+    snapshot: this tool cannot tell an Access-protected domain from any other,
+    so only the domain in the checkout's own config may be deployed.
+    """
+    path = Path(site) / "wrangler.jsonc"
+    if not path.is_file():
+        return []
+    config = parse_jsonc(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError("deploy config must be a JSON object")
+    urls = []
+    for key in ("route", "routes"):
+        value = config.get(key)
+        if not value:
+            continue
+        for route in value if isinstance(value, list) else [value]:
+            url = _custom_url(route)
+            if url:
+                urls.append(url)
+    return urls
+
+
+def check_deploy_config(config, approved=None):
     """Refuse a config whose extra hostnames would serve the site outside Access.
 
     Both flags must be literally false: wrangler turns workers.dev on when
@@ -260,7 +294,9 @@ def check_deploy_config(config):
     checked too, since `wrangler deploy --env` would apply it. Exactly one
     route may exist and it must be the custom_domain route: a plain `route`,
     a second `routes` entry or a second custom domain serves the snapshot on
-    a hostname outside the Access-protected domain.
+    a hostname outside the Access-protected domain. With `approved`, that
+    route must also be one of the domains the checkout ships, so a config
+    passed in by hand cannot point the snapshot at another hostname.
     """
     if not isinstance(config, dict):
         raise ValueError("deploy config must be a JSON object")
@@ -290,10 +326,9 @@ def check_deploy_config(config):
             if not value:
                 continue
             for route in value if isinstance(value, list) else [value]:
-                if (isinstance(route, dict) and route.get("custom_domain") is True
-                        and isinstance(route.get("pattern"), str)
-                        and route["pattern"].strip("/")):
-                    urls.append("https://%s/" % route["pattern"].strip("/"))
+                url = _custom_url(route)
+                if url:
+                    urls.append(url)
                 else:
                     others.append("%s %s %s is not a custom_domain route" % (
                         where, key, json.dumps(route)))
@@ -306,6 +341,11 @@ def check_deploy_config(config):
     if len(urls) > 1:
         raise ValueError("Refusing to deploy: %s are custom_domain routes. The snapshot may "
                          "be served on one Access-protected domain only." % ", ".join(urls))
+    if approved is not None and urls[0] not in approved:
+        raise ValueError("Refusing to deploy: %s is not a custom domain this checkout "
+                         "approves (%s). --wrangler-config may change settings, not the "
+                         "hostname that serves the snapshot." % (
+                             urls[0], ", ".join(approved) or "none in site/wrangler.jsonc"))
     return urls
 
 
@@ -320,7 +360,7 @@ def deploy(directory, site=None, config_path=None, dry_run=False, env=None,
     site = site_dir(site)
     config_path = Path(config_path).expanduser() if config_path else site / "wrangler.jsonc"
     config = parse_jsonc(config_path.read_text(encoding="utf-8"))
-    urls = check_deploy_config(config)
+    urls = check_deploy_config(config, approved=approved_routes(site))
     snapshot = json.loads((directory / "snapshot.json").read_text(encoding="utf-8"))
     config = dict(config)
     config.pop("$schema", None)

@@ -27,6 +27,7 @@ DECISION_STATES = ("backlog", "claimed")
 TASK_FIELDS = ("id", "lane", "title", "kind", "state", "priority", "project", "claimed_by",
                "created_at", "updated_at")
 TRAILER = re.compile(r"^\s*Mergewake-Task:\s*(\d+)\s*$", re.M | re.I)
+TASK_ID = re.compile(r"^\d+$")
 DOC_KEY = re.compile(r"^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
 _FRACTION = re.compile(r"\.(\d+)")
 
@@ -95,10 +96,14 @@ def load(directory):
     tasks = read("tasks.json", {"tasks": []})
     if not isinstance(tasks, dict) or not isinstance(tasks.get("tasks"), list):
         raise ValueError("tasks.json must be an object with a tasks list")
+    for task in tasks["tasks"]:
+        if not isinstance(task, dict):
+            raise ValueError("tasks.json must hold task objects")
+        task["id"] = task_id(task.get("id"))
     raw_comments = read("comments.json", {})
     if not isinstance(raw_comments, dict):
         raise ValueError("comments.json must be an object keyed by task id")
-    by_key = {str(t.get("id")): t.get("id") for t in tasks["tasks"]}
+    by_key = {str(t["id"]): t["id"] for t in tasks["tasks"]}
     comments = {}
     for key, value in raw_comments.items():
         if str(key) not in by_key:
@@ -183,8 +188,22 @@ def _run(argv, cwd=None):
     return result.stdout
 
 
+def task_id(value):
+    """hk task ids are integers; the API, a fixture or saved JSON may hold them as strings.
+
+    Page slugs, comments and ``hk N`` labels are all built from this one value,
+    so it is parsed here and nowhere else.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and TASK_ID.match(value):
+        return int(value)
+    raise ValueError("task id %r is not an integer" % (value,))
+
+
 def _task(raw):
     task = {name: raw.get(name) for name in TASK_FIELDS}
+    task["id"] = task_id(task["id"])
     refs = raw.get("refs") or {}
     request = refs.get("decision_request")
     if request:

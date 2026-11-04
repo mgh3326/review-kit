@@ -143,7 +143,8 @@ def _site_parser(commands):
         "deploy", help="wrangler deploy a built snapshot (refuses workers_dev/preview_urls)")
     deploy.add_argument("directory", type=Path)
     deploy.add_argument("--wrangler-config", type=Path,
-                        help="deploy config (default: site/wrangler.jsonc)")
+                        help="deploy config (default: site/wrangler.jsonc); its route must be "
+                             "the domain site/wrangler.jsonc approves")
     deploy.add_argument("--dry-run", action="store_true",
                         help="check the config and print the plan without deploying")
     deploy.add_argument("--site-dir", type=Path)
