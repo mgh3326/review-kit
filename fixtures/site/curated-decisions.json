@@ -1,0 +1,20 @@
+{
+ "items": {
+  "2001": {
+   "status": "owner",
+   "ask": "A or B for {format}?",
+   "options": [
+    "A: json",
+    "B: <csv>"
+   ],
+   "recommendation": "A",
+   "latest": "Implemented on a branch; needs an owner (hk 2002)."
+  }
+ },
+ "exclude_docs": {
+  "research/2026-01-02/already-decided": "already decided"
+ },
+ "doc_project": {
+  "research/2026-01-02/sample-note": "alpha"
+ }
+}

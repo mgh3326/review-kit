@@ -1,0 +1,100 @@
+{
+ "tasks": [
+  {
+   "id": 1001,
+   "lane": "lane-alpha",
+   "title": "Fix \"q\" onmouseover=\"alert(2)\" {process.exit(1)} and <script>alert(1)</script> via [x](javascript:alert(1)) | *b* _u_ #h",
+   "kind": "implement",
+   "state": "claimed",
+   "priority": 2,
+   "project": "alpha",
+   "claimed_by": "worker-{x}",
+   "created_at": "2026-11-01T10:00:00.12345+09:00",
+   "updated_at": "2026-11-03T12:00:00+09:00"
+  },
+  {
+   "id": 1002,
+   "lane": "lane-alpha",
+   "title": "Add retry budget to the sync loop",
+   "kind": "implement",
+   "state": "claimed",
+   "priority": 3,
+   "project": "alpha",
+   "claimed_by": "worker-b",
+   "created_at": "2026-11-01T10:00:00.12345+09:00",
+   "updated_at": "2026-11-03T12:00:00+09:00"
+  },
+  {
+   "id": 1003,
+   "lane": "lane-alpha",
+   "title": "Document the export format",
+   "kind": "implement",
+   "state": "backlog",
+   "priority": 1,
+   "project": "alpha",
+   "claimed_by": null,
+   "created_at": "2026-10-20T08:00:00Z",
+   "updated_at": "2026-11-03T12:00:00+09:00"
+  },
+  {
+   "id": 1004,
+   "lane": "lane-beta",
+   "title": "1. Looks like a list item - but is a title",
+   "kind": "implement",
+   "state": "backlog",
+   "priority": 0,
+   "project": "beta",
+   "claimed_by": null,
+   "created_at": "2026-11-01T10:00:00.12345+09:00",
+   "updated_at": "2026-11-03T12:00:00+09:00"
+  },
+  {
+   "id": 1005,
+   "lane": "lane-none",
+   "title": "Task without a project",
+   "kind": "decide",
+   "state": "backlog",
+   "priority": 4,
+   "project": null,
+   "claimed_by": null,
+   "created_at": "2026-11-01T10:00:00.12345+09:00",
+   "updated_at": "2026-11-03T12:00:00+09:00"
+  },
+  {
+   "id": 1006,
+   "lane": "lane-beta",
+   "title": "Verify the rollout",
+   "kind": "implement",
+   "state": "verifying",
+   "priority": 3,
+   "project": "beta",
+   "claimed_by": null,
+   "created_at": "2026-11-01T10:00:00.12345+09:00",
+   "updated_at": "2026-11-04T08:00:00+09:00"
+  },
+  {
+   "id": 1007,
+   "lane": "lane-beta",
+   "title": "Held: waits for vendor",
+   "kind": "implement",
+   "state": "hold",
+   "priority": 3,
+   "project": "beta",
+   "claimed_by": null,
+   "created_at": "2026-11-01T10:00:00.12345+09:00",
+   "updated_at": "2026-11-03T12:00:00+09:00"
+  },
+  {
+   "id": 1008,
+   "lane": "lane-beta",
+   "title": "Backlog task with an open PR",
+   "kind": "implement",
+   "state": "backlog",
+   "priority": 2,
+   "project": "beta",
+   "claimed_by": null,
+   "created_at": "2026-11-01T10:00:00.12345+09:00",
+   "updated_at": "2026-11-03T12:00:00+09:00"
+  }
+ ]
+}

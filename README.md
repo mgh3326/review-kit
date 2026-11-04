@@ -9,6 +9,7 @@ Prepare, package, and share review material. `prep_video.py` remains available f
 - Python 3.9 or newer, standard library only.
 - `ffmpeg` and `ffprobe` are needed only when preparing videos. They must be on PATH with libx264 and AAC encoders and the `scale` (with `in_range`/`out_range`), `setsar`, `fps`, `format`, and `setparams` filters. Encoding is always software libx264.
 - For video output, a local filesystem supporting hard links for atomic, no-overwrite finalization.
+- Node (version in `site/.nvmrc`) and `npm ci --prefix site` are needed only for `review-kit site`, the way FFmpeg is needed only for video. `site build` also uses the `handoffkeep` CLI (or `HANDOFFKEEP_URL` + `HANDOFFKEEP_TOKEN`), `gh` and `git` for the sources it reads. Every other command stays Python standard library only.
 
 Sharing uses the Python standard library and does not need FFmpeg. Configure a private Supabase Storage bucket or S3-compatible object store before using upload, status, listing, cleanup, or signing commands.
 
@@ -295,6 +296,33 @@ List JSON shape:
 
 `board comments` exists but only prints a pointer: comments are **not exposed by the Miro REST API** (the Miro REST introduction marks Comment CRUD unsupported). Collect reviewer comments with the Miro MCP comment tools (e.g. `comment_list_comments`) or in the board UI; the command exits with status 2.
 
+### Site: review snapshot behind Cloudflare Access
+
+`review-kit site` builds a static review site with [nimbus](https://github.com/cloudflare/nimbus) from hk, GitHub and git. The site is a **snapshot**: it is read once, every page shows the time it was read, and it is never kept in sync. Build a new one to refresh. The nimbus project lives in `site/` (pinned packages, `site/package-lock.json`); run it from a checkout of this repository, or pass `--site-dir` / set `REVIEW_KIT_SITE_DIR`.
+
+```bash
+npm ci --prefix site                     # once, with the Node version in site/.nvmrc
+
+review-kit site build --kind fleet --out ./snap-fleet \
+  --repo <OWNER>/<REPO> --repo <OWNER>/<REPO2> --git ~/work/<REPO>
+review-kit site build --kind decisions --project <PROJECT> --out ./snap-decisions \
+  --doc-prefix research/2026-11-04 --curated ./curated.json
+review-kit site deploy ./snap-fleet      # wrangler deploy with site/wrangler.jsonc
+review-kit site bundle ./snap-fleet --out ./snap-fleet-md
+review-kit share ./snap-fleet-md reviews/snap-fleet   # readers who cannot pass Access
+```
+
+- `--kind fleet`: open hk tasks by project and state, open PRs with their hk tasks (`Mergewake-Task:` lines in the PR body) and CI, local branches with no PR, backlog by priority, and tasks whose state disagrees with their PRs (merged but still claimed, merged or open but still backlog).
+- `--kind decisions`: open tasks that wait for the operator (an open hk decision request, `kind=decide`, or `waiting: operator` in the title or latest comment), each with its comment timeline, plus the hk documents under `--doc-prefix` or referenced by those tasks (`decision/` excluded).
+- Reads are read-only: `handoffkeep tasks list/comments`, `doc list/get` (or `GET /v1/...` when `HANDOFFKEEP_URL` and `HANDOFFKEEP_TOKEN` are set), `gh pr list`, and local `git for-each-ref`/`rev-list`/`log` (no fetch). `--project` limits hk tasks to one project. `--save-data DIR` keeps the normalised inputs; `--from-data DIR` builds from saved inputs offline (the test fixtures in `fixtures/site/` use this form).
+- `--curated curated.json` is optional: `summary` (markdown for the home page), `pages` (`slug`, `title`, `description`, `body`; ```` ```mermaid ```` fences become diagrams), and for `decisions` `items` keyed by task id or doc key (`status` `open|owner|done`, `ask`, `options`, `recommendation`, `latest`), `exclude_docs` and `doc_project`.
+- Each build deletes the Astro caches (`site/.astro`, `site/node_modules/.astro`, `.vite`, `dist`) and the generated `site/src/content/docs/` first, then runs the production build; one build runs at a time (`site/.build.lock`). The output folder gets `snapshot.json`: schema, kind, project, snapshot time, inputs (no tokens), page list and counts. The build fails if any page lacks the snapshot banner.
+- All hk, GitHub, git and curated text is treated as untrusted. MDX `{…}`, `<…>`, `import`/`export` lines, markdown links/images and `:::` blocks are escaped; fenced code is re-emitted inside a fence the generator chooses. `robots.txt` disallows everything.
+
+`site deploy DIR` runs the pinned `wrangler deploy` with `site/wrangler.jsonc` (worker `hk-review`, custom domain `review.robinco.dev`, assets = `DIR`). It needs `CLOUDFLARE_API_TOKEN` in the environment and the account id from `CLOUDFLARE_ACCOUNT_ID` or an `account_id` key in the config; neither is committed. It **refuses to deploy** unless `workers_dev` and `preview_urls` are both literally `false` (top level and every `env.*` block), because a `*.workers.dev` or preview hostname would serve the snapshot without Cloudflare Access, and it refuses a config with no custom-domain route. It prints the URL and the version id. `--dry-run` checks the config and prints the plan without a token. `--wrangler-config` picks another config file.
+
+`site bundle DIR --out OUT` copies the markdown export: `llms.txt` (links rewritten to the bundle's own files), `llms-full.txt`, `pages/**.md` (one file per page, plus section `llms.txt`), `snapshot.json` and a short `README.md`. The folder is ready for `review-kit share`.
+
 ## Usage
 
 ```bash
@@ -362,15 +390,17 @@ On failure, completed clips are retained with `status: failed` and `ERROR.txt`; 
 ## Tests
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py && python3 test_review_kit.py && python3 test_drive_share.py
+PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py && python3 test_review_kit.py && python3 test_drive_share.py && python3 test_site.py
 ```
 
 On Windows or a different environment, choose a writable cache path or omit the environment assignment. Tests create tiny synthetic inputs and preserve results under `test_artifacts/`. Successful paths use real FFmpeg/ffprobe. Certain oversize, timeout, missing-tool, and validation-failure cases use explicit mocks. Tests cover audio/no audio, delayed/short audio, delayed-video rejection, odd dimensions, portrait, rotation 90, full/limited/unspecified color range (black/white pixel levels checked within ±3), a reproduction of the pre-fix full-range failure, HDR rejection, conflicting color tags, missing FFmpeg filters, one-frame clips, decimal/binary caps, strict size-cap and duration boundaries, silent inputs recorded as audio absent, Korean/space paths, collisions, bounded retries/floors, interruption without DONE, corrupted media, and final-metadata failure without DONE.
 
 `test_review_kit.py` uses a fake backend and no network. It covers mixed Drive/storage INDEX rows, Drive-only packages, ledger cleanup, capacity-based oldest-first pruning, re-signing without package re-upload, `MANIFEST.json` content and refresh, `verify` OK/missing/mismatch/extra, safe object keys, and AWS-published SigV4 signatures.
 
+`test_site.py` covers the site: MDX escaping (hostile strings and a seeded fuzz), page generation on the synthetic fixtures in `fixtures/site/`, the hk/gh/git readers with fake runners, the build orchestration with a fake Astro, the deploy guard (`workers_dev`/`preview_urls`, env blocks, custom domain, token) and the bundle. `SiteBuildTest` runs the real nimbus build and checks the built HTML; it needs `npm ci --prefix site` and `REVIEW_KIT_SITE_BUILD=1` (CI's `site` job).
+
 `test_drive_share.py` uses fake `fileproviderctl`, `ssh`, `rsync` and `rclone` runners and no real Drive mount. It covers upload-state parsing, `--host` over ssh, the Drive and Dropbox backends, the Drive → Dropbox → storage fallback, and `share-gc` dry run, SHA256 matching and capacity pruning.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). No third-party code is vendored. FFmpeg/ffprobe are external runtime dependencies with their own licenses; they are not distributed here.
+MIT. See [LICENSE](LICENSE). `site/` starts from the nimbus starter template (MIT, Cloudflare) and carries its Inter font files (SIL Open Font License) for social cards; no other third-party code is vendored, and npm packages are installed from `site/package-lock.json`, not committed. FFmpeg/ffprobe are external runtime dependencies with their own licenses; they are not distributed here.

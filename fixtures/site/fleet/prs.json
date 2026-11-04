@@ -1,0 +1,106 @@
+{
+ "example-org/alpha-repo": {
+  "open": [
+   {
+    "number": 12,
+    "title": "Retry budget <b>bold</b> {x}",
+    "url": "https://github.com/example-org/alpha-repo/pull/12",
+    "author": "dev-a",
+    "bot": false,
+    "branch": "feat/retry",
+    "draft": false,
+    "created_at": "2026-11-03T01:00:00Z",
+    "merged_at": null,
+    "checks": {
+     "ok": 3,
+     "failed": 0,
+     "pending": 0
+    },
+    "task_ids": [
+     1002
+    ]
+   },
+   {
+    "number": 13,
+    "title": "chore(deps): bump x",
+    "url": "https://github.com/example-org/alpha-repo/pull/13",
+    "author": "app/renovate",
+    "bot": true,
+    "branch": "renovate/x",
+    "draft": false,
+    "created_at": "2026-11-02T01:00:00Z",
+    "merged_at": null,
+    "checks": {
+     "ok": 0,
+     "failed": 1,
+     "pending": 0
+    },
+    "task_ids": []
+   }
+  ],
+  "merged": [
+   {
+    "number": 10,
+    "title": "Fix the first half of hk 1001",
+    "url": "https://github.com/example-org/alpha-repo/pull/10",
+    "author": "dev-a",
+    "bot": false,
+    "branch": "fix/a",
+    "draft": false,
+    "created_at": null,
+    "merged_at": "2026-11-02T03:04:00Z",
+    "checks": {
+     "ok": 0,
+     "failed": 0,
+     "pending": 0
+    },
+    "task_ids": [
+     1001
+    ]
+   },
+   {
+    "number": 9,
+    "title": "Already shipped",
+    "url": "javascript:alert(1)",
+    "author": "dev-b",
+    "bot": false,
+    "branch": "fix/b",
+    "draft": false,
+    "created_at": null,
+    "merged_at": "2026-11-01T03:04:00Z",
+    "checks": {
+     "ok": 0,
+     "failed": 0,
+     "pending": 0
+    },
+    "task_ids": [
+     1003
+    ]
+   }
+  ]
+ },
+ "example-org/beta-repo": {
+  "open": [
+   {
+    "number": 4,
+    "title": "Backlog task PR",
+    "url": "https://github.com/example-org/beta-repo/pull/4",
+    "author": "dev-c",
+    "bot": false,
+    "branch": "feat/beta",
+    "draft": true,
+    "created_at": "2026-11-04T07:30:00+09:00",
+    "merged_at": null,
+    "checks": {
+     "ok": 1,
+     "failed": 0,
+     "pending": 2
+    },
+    "task_ids": [
+     1008
+    ]
+   }
+  ],
+  "merged": []
+ }
+}

@@ -98,6 +98,8 @@ def _parser():
         help="not available via Miro REST; points to MCP comment tools")
     comments.add_argument("board_id")
 
+    _site_parser(commands)
+
     package = commands.add_parser("package", help="assemble videos, stills and a review request")
     package.add_argument("output", type=Path)
     package.add_argument("--video", action="append", default=[], type=Path,
@@ -111,6 +113,75 @@ def _parser():
     package.add_argument("--check", action="append", default=[],
                          help="what the reviewer should check; repeat for multiple items")
     return parser
+
+
+def _site_parser(commands):
+    site = commands.add_parser(
+        "site", help="static review snapshot site (nimbus; needs Node, see site/.nvmrc)")
+    site_commands = site.add_subparsers(dest="site_command", required=True)
+    build = site_commands.add_parser(
+        "build", help="read hk/GitHub/git, generate pages and run the nimbus build")
+    build.add_argument("--kind", required=True, choices=("fleet", "decisions"))
+    build.add_argument("--out", required=True, type=Path, help="new directory for the site")
+    build.add_argument("--project", help="only hk tasks of this project")
+    build.add_argument("--repo", action="append", default=[], metavar="OWNER/NAME",
+                       help="GitHub repository for open/merged PRs; repeat")
+    build.add_argument("--git", action="append", default=[], type=Path, metavar="CHECKOUT",
+                       help="local checkout whose unpushed branches are listed; repeat")
+    build.add_argument("--doc-prefix", action="append", default=[], metavar="PREFIX",
+                       help="decisions: also include hk docs under this key prefix; repeat")
+    build.add_argument("--curated", type=Path,
+                       help="optional curated.json with summaries, items and extra pages")
+    build.add_argument("--from-data", type=Path, metavar="DIR",
+                       help="build from saved snapshot data instead of reading hk/GitHub/git")
+    build.add_argument("--save-data", type=Path, metavar="DIR",
+                       help="also write the fetched snapshot data to this new directory")
+    build.add_argument("--title", help="site title (default depends on --kind)")
+    build.add_argument("--site-url", help="canonical origin (default: wrangler.jsonc domain)")
+    build.add_argument("--site-dir", type=Path, help="nimbus project (default: ./site)")
+    deploy = site_commands.add_parser(
+        "deploy", help="wrangler deploy a built snapshot (refuses workers_dev/preview_urls)")
+    deploy.add_argument("directory", type=Path)
+    deploy.add_argument("--wrangler-config", type=Path,
+                        help="deploy config (default: site/wrangler.jsonc)")
+    deploy.add_argument("--dry-run", action="store_true",
+                        help="check the config and print the plan without deploying")
+    deploy.add_argument("--site-dir", type=Path)
+    bundle = site_commands.add_parser(
+        "bundle", help="markdown export of a built snapshot, as a folder for `share`")
+    bundle.add_argument("directory", type=Path)
+    bundle.add_argument("--out", required=True, type=Path, help="new directory for the bundle")
+
+
+def _run_site(args):
+    from . import site
+    if args.site_command == "build":
+        out, manifest = site.build(
+            args.kind, args.out, project=args.project, from_data=args.from_data,
+            save_data=args.save_data, curated=args.curated, repos=args.repo,
+            git_dirs=args.git, doc_prefixes=args.doc_prefix, site=args.site_dir,
+            title=args.title, site_url=args.site_url,
+            log=lambda line: print(line, file=sys.stderr))
+        print("snapshot %s: %d pages -> %s" % (manifest["snapshot"], len(manifest["pages"]),
+                                               out))
+        return 0
+    if args.site_command == "deploy":
+        result = site.deploy(args.directory, site=args.site_dir,
+                             config_path=args.wrangler_config, dry_run=args.dry_run)
+        for url in result["urls"]:
+            print("url: %s" % url)
+        print("snapshot: %s" % result["snapshot"])
+        if result["dry_run"]:
+            print("account id: %s" % result["account"])
+            print("Dry run; nothing was deployed.")
+        else:
+            print("version id: %s" % (result["version_id"] or "unknown (see wrangler output)"))
+        return 0
+    if args.site_command == "bundle":
+        out, files = site.bundle(args.directory, args.out)
+        print("bundle: %d page(s) -> %s" % (len(files), out))
+        return 0
+    raise ValueError("unsupported command")
 
 
 def _share_upload_parser():
@@ -320,6 +391,8 @@ def main(argv=None):
             return _run_verify(args)
         if args.command == "board":
             return _run_board_command(args)
+        if args.command == "site":
+            return _run_site(args)
         config, backend, ledger_path = _backend_and_ledger(args)
         if args.command == "share" and args.share_command == "upload":
             manifest = _load_drive_manifest(args.drive_manifest)

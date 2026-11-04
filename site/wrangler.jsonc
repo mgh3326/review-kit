@@ -1,0 +1,19 @@
+// Deploy config for `review-kit site deploy DIR`.
+// The site sits behind Cloudflare Access on its custom domain, so the
+// *.workers.dev and preview URLs stay off: either one would serve the same
+// snapshot without Access. `review-kit site deploy` refuses to run unless both
+// are false. The assets directory is set by the command to the DIR it is given.
+// The account id comes from CLOUDFLARE_ACCOUNT_ID (or an "account_id" key here),
+// the token from CLOUDFLARE_API_TOKEN; neither is committed.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hk-review",
+  "compatibility_date": "2026-11-03",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "review.robinco.dev", "custom_domain": true }],
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "404-page"
+  }
+}

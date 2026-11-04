@@ -1,0 +1,11 @@
+{
+ "summary": "Synthetic summary with {braces}, <tags> and a list:\n\n- one\n- two",
+ "pages": [
+  {
+   "slug": "gaps",
+   "title": "보완할 점",
+   "description": "curated gaps page",
+   "body": "## Context\n\n```mermaid\nflowchart LR\n  A[\"hk {x}\"] --> B[\"<b>gh</b>\"]\n```\n\n| sev | gap |\n|---|---|\n| high | {danger} |\n"
+  }
+ ]
+}
