@@ -16,7 +16,7 @@ OS support — exactly what has been verified:
 
 - **macOS Apple Silicon (arm64): tests pass locally** with the color-range fix — macOS 27.0.1, Python 3.14.7, FFmpeg/ffprobe 9.0.2 (Homebrew). A real 245.7 s full-range (`yuvj420p`/`pc`, BT.709, rotation 90) HEVC screen recording was also processed end to end into 3 validated clips.
 - **macOS Intel (x86_64): not yet re-verified with the color-range fix.** Earlier code (before the fix) passed tests on macOS 26.6.2, Python 3.9.6, FFmpeg/ffprobe 8.1; Python 3.9 is no longer supported, so Intel has not been verified on a supported Python. CI's `macos-latest` runner is Apple Silicon, so CI does not cover Intel.
-- **CI:** ubuntu-latest, macos-latest, and windows-latest × Python 3.10, 3.12 and 3.14, 9 jobs; 3.10 is the declared minimum (`.github/workflows/ci.yml`). Python 3.9 was dropped after it reached end of life in October 2025. The last all-green run of the earlier 9-job matrix, which included Python 3.9, is [39414034940](https://github.com/mgh3326/review-kit/actions/runs/39414034940).
+- **CI:** ubuntu-latest, macos-latest, and windows-latest × Python 3.10, 3.12 and 3.14, 9 jobs; 3.10 is the declared minimum (`.github/workflows/ci.yml`). Python 3.9 was dropped after it reached end of life in October 2025. The last all-green run of the earlier matrix, which included Python 3.9, is [41421222876](https://github.com/mgh3326/review-kit/actions/runs/41421222876).
 
 FFmpeg/ffprobe are external runtime dependencies for video preparation: they are not bundled with and are not installed by this project. FFmpeg needs libx264 and AAC encoders. Upload and signing use the standard library and require a configured storage account.
 
