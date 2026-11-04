@@ -1,0 +1,14 @@
+{
+ "research/2026-01-02/sample-note": {
+  "key": "research/2026-01-02/sample-note",
+  "kind": "report",
+  "body": "# Sample note\n\nCompares A and B for hk 2001.\n\n| a | b |\n|---|---|\n| {1} | <2> |\n\n```\nunclosed fence {x}\n<y>",
+  "updated_at": "2026-11-02T10:00:00+09:00"
+ },
+ "research/2026-01-02/already-decided": {
+  "key": "research/2026-01-02/already-decided",
+  "kind": "report",
+  "body": "Decision (operator): done.",
+  "updated_at": "2026-11-02T10:00:00+09:00"
+ }
+}

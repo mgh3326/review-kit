@@ -268,6 +268,29 @@ review-kit --profile work board comments <BOARD_ID>
 
 `board comments`는 존재하지만 안내 메시지만 출력합니다. Miro REST API는 댓글을 제공하지 않습니다(REST 소개 문서의 Comment CRUD가 지원 안 됨). 검수자 댓글은 Miro MCP 댓글 도구(`comment_list_comments` 등)나 보드 UI로 모으세요. 종료 코드는 2입니다.
 
+### site: Cloudflare Access 뒤의 검토 스냅샷 사이트
+
+`review-kit site`는 hk·GitHub·git을 읽어 [nimbus](https://github.com/cloudflare/nimbus) 정적 검토 사이트를 만듭니다. 사이트는 **스냅샷**입니다. 한 번 읽고 모든 페이지에 읽은 시각을 표시하며 hk와 동기화하지 않습니다. 새로 보려면 다시 빌드합니다. nimbus 프로젝트는 `site/`에 있고(패키지 고정, `site/package-lock.json`), 이 저장소 체크아웃에서 실행하거나 `--site-dir` / `REVIEW_KIT_SITE_DIR`을 지정합니다. 이 기능에만 Node(`site/.nvmrc` 버전)가 필요합니다. 영상에만 FFmpeg가 필요한 것과 같고, 다른 명령은 계속 Python 표준 라이브러리만 씁니다.
+
+```bash
+npm ci --prefix site                     # 한 번, site/.nvmrc의 Node 버전으로
+
+review-kit site build --kind fleet --out ./snap-fleet --repo <OWNER>/<REPO> --git ~/work/<REPO>
+review-kit site build --kind decisions --project <PROJECT> --out ./snap-decisions --curated ./curated.json
+review-kit site deploy ./snap-fleet      # site/wrangler.jsonc로 wrangler deploy
+review-kit site bundle ./snap-fleet --out ./snap-fleet-md
+review-kit share ./snap-fleet-md reviews/snap-fleet   # Access를 못 통과하는 독자용
+```
+
+- `fleet`: 프로젝트·상태별 열린 태스크, 열린 PR과 연결된 hk 태스크(PR 본문의 `Mergewake-Task:`)·CI, PR 없는 로컬 브랜치, 우선순위별 backlog, PR과 상태가 어긋난 태스크.
+- `decisions`: 운영자를 기다리는 열린 태스크(hk 결정 요청이 열림, `kind=decide`, 제목·최신 코멘트의 `waiting: operator`)와 코멘트 타임라인, `--doc-prefix` 문서와 그 태스크가 참조한 문서(`decision/` 제외).
+- 읽기 전용입니다. `handoffkeep` CLI(또는 `HANDOFFKEEP_URL`+`HANDOFFKEEP_TOKEN`의 `GET /v1/...`), `gh pr list`, 로컬 `git`(fetch 없음). `--save-data`로 입력을 저장하고 `--from-data`로 오프라인 빌드합니다. `curated.json`(요약·추가 페이지·항목별 질문/권고)은 선택입니다.
+- 빌드마다 Astro 캐시(`.astro`, `node_modules/.astro`, `.vite`, `dist`)와 생성 콘텐츠를 지운 뒤 production 빌드를 돌리고, 출력에 `snapshot.json`(시각·입력·페이지 목록·건수, 토큰 없음)을 씁니다. 에이전트가 쓴 글의 MDX `{…}`·`<…>`·`import`/`export`·링크·`:::`는 모두 이스케이프됩니다.
+
+`site deploy DIR`은 `CLOUDFLARE_API_TOKEN`과 계정 id(`CLOUDFLARE_ACCOUNT_ID` 또는 설정의 `account_id`)로 배포하고 URL과 version id를 출력합니다. `workers_dev`와 `preview_urls`가 최상위와 모든 `env.*`에서 정확히 `false`가 아니거나 custom domain 경로가 아닌 경로가 있거나, custom domain이 `site/wrangler.jsonc`가 승인한 도메인이 아니면 **배포를 거부**합니다. `*.workers.dev`·preview 주소는 Access를 우회하고, 이 도구는 다른 도메인이 Access로 보호되는지 알 수 없기 때문입니다. `--dry-run`은 토큰 없이 설정만 검사합니다.
+
+`site bundle DIR --out OUT`은 마크다운 내보내기(`llms.txt`, `llms-full.txt`, 페이지별 `pages/**.md`, `snapshot.json`, `README.md`)를 `review-kit share`로 보낼 폴더로 만듭니다. 모든 마크다운 파일의 링크는 그 파일 기준 상대 경로로 번들 안 파일을 가리킵니다.
+
 ## 빠른 시작
 
 ```bash
@@ -371,12 +394,14 @@ python3 prep_video.py recording.mp4 --min-vkbps 2500 --vkbps 5000
 ## 테스트
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py && python3 test_review_kit.py && python3 test_drive_share.py
+PYTHONPYCACHEPREFIX=/tmp/prep_video_pycache python3 test_prep_video.py && python3 test_review_kit.py && python3 test_drive_share.py && python3 test_site.py
 ```
 
 설치된 FFmpeg로 0.017~1.4초 합성 영상을 생성합니다. 실제 기기 녹음이 아니며 생성 오디오는 테스트에서 `reconstructed`로 표기합니다. 음성/무음·홀수 크기·세로·회전 90·전체/제한/미지정 색 범위(흑/백 픽셀 값 ±3 검사)·수정 전 전체 범위 실패 재현·HDR 거부·색 태그 충돌·필터 부재·초단편·십진/이진 바이트 제한·입력 오류·도구 부재·출력 충돌·손상/시간 초과·검증 실패·재시도 상한/복구를 검사합니다. 재시도 크기 초과·디코딩 실패·시간 초과는 결정적인 검증을 위해 일부 함수를 모의 처리하며, 정상 변환·디코딩·크기/해시 검사는 실제 도구를 사용합니다. 결과는 `test_artifacts/test_results.json`, 로그와 합성 산출물로 남습니다. 원본 실영상 전체를 인코딩하지 않습니다.
 
 `test_review_kit.py`는 네트워크 없이 가짜 저장소를 사용합니다. Drive/스토리지 혼합 INDEX, Drive 전용 패키지, 원장 정리, 용량 기준 오래된 순서의 prune, 파일 재업로드 없는 resign, 안전한 객체 키, AWS 공개 SigV4 서명을 검사합니다.
+
+`test_site.py`는 MDX 이스케이프(악성 문자열·고정 시드 퍼즈), `fixtures/site/`의 합성 데이터로 페이지 생성, 가짜 실행기로 hk/gh/git 읽기, 가짜 Astro로 빌드 절차, 배포 가드(`workers_dev`/`preview_urls`·env 블록·custom domain·토큰), 번들을 검사합니다. `SiteBuildTest`는 실제 nimbus 빌드를 돌리며 `npm ci --prefix site`와 `REVIEW_KIT_SITE_BUILD=1`이 필요합니다(CI의 `site` 작업).
 
 `test_drive_share.py`는 가짜 `fileproviderctl`, `ssh`, `rsync`, `rclone` 실행기를 쓰며 실제 Drive 마운트가 필요 없습니다. 업로드 상태 해석, ssh를 통한 `--host`, Drive·Dropbox 저장소, Drive → Dropbox → 스토리지 대체 순서, `share-gc`의 시험 실행·SHA256 일치·용량 정리를 검사합니다.
 

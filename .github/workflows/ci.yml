@@ -39,4 +39,28 @@ jobs:
         run: |
           python test_prep_video.py
           python test_review_kit.py
+          python test_site.py
           python test_drive_share.py
+
+  # `review-kit site build` on the synthetic fixtures with the pinned Node and
+  # nimbus packages: proves the generated MDX builds and stays inert.
+  site:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: site/.nvmrc
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install site packages
+        run: npm ci --prefix site --no-audit --no-fund
+
+      - name: Build the fixture sites
+        env:
+          REVIEW_KIT_SITE_BUILD: "1"
+        run: python test_site.py SiteBuildTest

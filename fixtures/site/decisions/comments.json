@@ -1,0 +1,40 @@
+{
+ "2001": [
+  {
+   "id": 1,
+   "author": "lane-alpha",
+   "body": "Two options: A (json) or B (csv). See `research/2026-01-02/sample-note`.",
+   "created_at": "2026-11-02T00:00:00Z"
+  }
+ ],
+ "2002": [
+  {
+   "id": 2,
+   "author": "w-1",
+   "body": "Started.",
+   "created_at": "2026-11-02T00:00:00Z"
+  },
+  {
+   "id": 3,
+   "author": "w-1",
+   "body": "Plan for the fix:\n\nimport fs from \"node:fs\"\nexport const leak = fs.readFileSync(\"/etc/passwd\", \"utf8\")\n{globalThis.process.exit(1)}\n<img src=x onerror=alert(1)> <Type /> and <N> in text, `wk/s<N>-<Slug>` in code\n\\`{notcode}`\n- item `{inline}` and `safe code`\n- [link](javascript:alert(document.cookie)) and <https://example.test>\n<!-- html comment -->\n\n```js\nconst a = {b: 1}; // <tag> ``` inside\n```\n\nwaiting: operator — pick A or B (see hk 1002 and research/2026-01-02/sample-note).",
+   "created_at": "2026-11-03T00:00:00Z"
+  }
+ ],
+ "2003": [],
+ "2004": [
+  {
+   "id": 4,
+   "author": "x",
+   "body": "waiting: operator was earlier",
+   "created_at": "2026-11-01T00:00:00Z"
+  },
+  {
+   "id": 5,
+   "author": "x",
+   "body": "resolved",
+   "created_at": "2026-11-02T00:00:00Z"
+  }
+ ],
+ "2005": []
+}

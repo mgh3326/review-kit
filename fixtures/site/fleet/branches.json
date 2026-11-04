@@ -1,0 +1,24 @@
+[
+ {
+  "repo": "alpha-repo",
+  "branch": "wk/local-only",
+  "ahead": 2,
+  "base": "origin/main",
+  "committed_at": "2026-11-04T06:00:00+09:00",
+  "subject": "WIP {draft} <em>",
+  "task_ids": [
+   1001
+  ]
+ },
+ {
+  "repo": "alpha-repo",
+  "branch": "feat/retry",
+  "ahead": 1,
+  "base": "origin/main",
+  "committed_at": "2026-11-03T06:00:00+09:00",
+  "subject": "has an open PR",
+  "task_ids": [
+   1002
+  ]
+ }
+]
